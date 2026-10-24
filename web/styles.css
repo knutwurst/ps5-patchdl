@@ -42,8 +42,7 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
-/* One focus ring for everything the controller, keyboard or a phone can
-   reach. */
+/* one focus ring for controller, keyboard and phone */
 :where(button, a, summary, select, input, textarea, [tabindex]):focus-visible {
   outline: none;
   box-shadow: var(--focus);
@@ -69,7 +68,7 @@ svg {
 
 .icon-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 
-/* ---------------- shell + rail ---------------- */
+/* shell + rail */
 
 .app-shell {
   display: grid;
@@ -175,7 +174,7 @@ svg {
 .diag-copy { justify-self: start; width: auto; padding: 0 18px; }
 .donate-open { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; justify-self: start; padding: 0 18px; }
 
-/* ---------------- views + topbar ---------------- */
+/* views + topbar */
 
 .main { min-width: 0; padding: 26px 28px 40px; }
 
@@ -228,7 +227,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 .primary-button { padding: 0 16px; border-color: var(--green-dark); background: var(--green); color: #fff; }
 .primary-button:hover { background: var(--green-dark); }
 
-/* ---------------- status strip ---------------- */
+/* status strip */
 
 .status-strip {
   display: grid;
@@ -237,10 +236,7 @@ h2 { font-size: 18px; line-height: 1.2; }
   margin-bottom: 18px;
 }
 
-/* ---------------- global download banner ---------------- */
-/* Sticky banner above the status strip, visible only while at least one
-   download is queued/active. The pulse dot and gradient bar at the bottom
-   echo the per-game card progress styling so the two read as one system. */
+/* global download banner, only while something is queued or running */
 .global-dl {
   position: relative;
   display: flex;
@@ -315,7 +311,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 .global-dl-track {
   position: relative;
   height: 3px;
-  margin: 0 -18px;     /* extend bar edge-to-edge */
+  margin: 0 -18px;     /* cancels the banner padding */
   background: rgba(56, 193, 114, 0.08);
   overflow: hidden;
 }
@@ -360,7 +356,7 @@ h2 { font-size: 18px; line-height: 1.2; }
   font-size: 20px;
 }
 
-/* ---------------- toolbar ---------------- */
+/* toolbar */
 
 .toolbar {
   display: grid;
@@ -405,7 +401,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 .chip-count { margin-left: 4px; color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
 .chip-count:empty { display: none; }
 
-/* ---------------- game cards ---------------- */
+/* game cards */
 
 .game-grid { display: grid; gap: 12px; }
 
@@ -459,7 +455,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 }
 .pills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 
-/* Installed -> update -> newest, read left to right. */
+/* installed, update, newest, left to right */
 .vtrack {
   display: flex;
   flex-wrap: wrap;
@@ -492,7 +488,6 @@ h2 { font-size: 18px; line-height: 1.2; }
 .vtrack-arrow { display: grid; place-items: center; color: var(--muted); }
 .vtrack-arrow svg { width: 20px; height: 20px; }
 
-/* A note that belongs to a card or dialog: icon, text, optional action. */
 .callout {
   display: flex;
   flex-wrap: wrap;
@@ -556,14 +551,13 @@ h2 { font-size: 18px; line-height: 1.2; }
 }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-/* ---------------- one morphing action button ---------------- */
+/* action button */
 
 .row-button {
-  width: 100%;            /* fills the fixed-width actions column -> never reflows */
+  width: 100%;            /* fixed column, so the label swap never reflows */
   padding: 0 12px;
   font-size: 15px;
 }
-/* go = green (Update / Resume / Install), pause = amber, cancel/stop = red */
 .row-button.is-update  { border-color: var(--green); color: #04150c; background: var(--green); }
 .row-button.is-update:hover  { background: var(--green-dark); }
 .row-button.is-pause   { border-color: var(--amber); color: #1c1402; background: var(--amber); }
@@ -575,7 +569,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 .row-button.is-ghost svg { color: var(--muted); }
 .row-button:disabled { opacity: 0.6; cursor: default; }
 
-/* ---------------- in-tile download progress ---------------- */
+/* card progress */
 
 .card-progress { display: grid; gap: 8px; }
 .progress {
@@ -592,7 +586,7 @@ h2 { font-size: 18px; line-height: 1.2; }
   transition: width 320ms ease;
 }
 .progress.is-indeterminate > i {
-  animation: progressSweep 1.6s linear infinite;   /* duration = INDET_MS */
+  animation: progressSweep 1.6s linear infinite;   /* same as INDET_MS in app.js */
   transition: none;
 }
 @keyframes progressSweep {
@@ -612,7 +606,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 }
 .progress-meta b { color: var(--ink); font-weight: 700; font-variant-numeric: tabular-nums; }
 
-/* ---------------- settings ---------------- */
+/* settings */
 
 .panel { padding: 18px; border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius); }
 
@@ -641,8 +635,7 @@ h2 { font-size: 18px; line-height: 1.2; }
   border-radius: 8px;
 }
 
-/* number stepper — big, controller-friendly targets with a clear focus ring
-   (the UI is operated by the PS5 controller via the home tile). */
+/* big targets, people drive this with the PS5 controller */
 .stepper { display: inline-flex; align-items: center; gap: 12px; flex: none; }
 .stepper-btn {
   width: 54px; height: 54px;
@@ -658,7 +651,7 @@ h2 { font-size: 18px; line-height: 1.2; }
 }
 .stepper-btn:hover { background: var(--surface); border-color: var(--muted); }
 .stepper-btn:active { transform: scale(0.93); background: var(--green-soft); border-color: var(--green); }
-/* :focus (not only :focus-visible) so the controller's focus is always obvious */
+/* :focus, not :focus-visible, or the controller focus gets lost */
 .stepper-btn:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
 .stepper-btn:disabled { opacity: 0.32; cursor: default; transform: none; }
 .stepper-value {
@@ -671,7 +664,6 @@ h2 { font-size: 18px; line-height: 1.2; }
 .switch-row > span:first-child strong { display: block; font-size: 14px; }
 .switch-row > span:first-child em { display: block; margin-top: 3px; color: var(--muted); font-size: var(--fs-xs); font-style: normal; }
 
-/* slider toggle (used for per-game enable + settings) */
 .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; flex: none; }
 .toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
 .toggle .track {
@@ -757,7 +749,7 @@ h2 { font-size: 18px; line-height: 1.2; }
   font-weight: 800;
 }
 
-/* ---------------- logs ---------------- */
+/* logs */
 
 pre {
   min-height: 200px;
@@ -783,7 +775,7 @@ pre {
   text-align: center;
 }
 
-/* ---------------- toast ---------------- */
+/* toast */
 
 .toast {
   position: fixed;
@@ -804,7 +796,7 @@ pre {
 }
 .toast.is-visible { opacity: 1; transform: translate(-50%, 0); }
 
-/* ---------------- older patch guide (Prospero) ---------------- */
+/* older patch guide */
 
 .guide-backdrop {
   position: fixed;
@@ -837,7 +829,7 @@ pre {
   .guide, .guide-backdrop { animation: none; }
 }
 
-/* Dialog with a long list: the header stays, the list scrolls. */
+/* long list: header stays, list scrolls */
 .guide-backdrop:has(.is-sheet) { grid-template-columns: minmax(0, 620px); }
 .guide.is-sheet {
   grid-template-rows: auto minmax(0, 1fr);
@@ -926,7 +918,7 @@ pre {
 }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 @media (prefers-reduced-motion: reduce) { .vskeleton i, .spinner { animation: none; } }
-/* minmax(0, 1fr): without it an <input>'s intrinsic width pushes the tracks wider than the sheet */
+/* without minmax(0, 1fr) an <input> pushes the tracks wider than the sheet */
 .guide, .guide-steps, .guide-steps li { grid-template-columns: minmax(0, 1fr); }
 .guide-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .guide-head > div { min-width: 0; }
@@ -950,7 +942,7 @@ pre {
 .guide-qr span { color: var(--muted); line-height: 1.5; }
 .guide-qr code { overflow-wrap: anywhere; color: var(--blue-dark); font-size: var(--fs-sm); }
 
-/* Console view: the PS5 can't copy links, so it only hands over to a phone. */
+/* the PS5 browser can't copy links, so just hand over to a phone */
 .guide.is-handoff { width: min(560px, 100%); justify-self: center; text-align: center; }
 .guide.is-handoff .guide-head { text-align: left; }
 .guide-handoff { display: grid; justify-items: center; gap: 12px; }
@@ -1016,16 +1008,15 @@ pre {
 .guide-progress { display: grid; gap: 6px; margin-top: 8px; color: var(--muted); font-size: var(--fs-sm); }
 
 @media (max-width: 720px) {
-  /* Already on a phone: the hand-off QR has nothing to add. */
+  /* already on a phone, no point showing a QR */
   .guide-qr { display: none; }
   .guide-backdrop { align-content: start; padding: 12px; }
   .guide { padding: 16px; }
 }
 
-/* ---------------- responsive ---------------- */
+/* responsive */
 
-/* Wide screens (desktop, PS5 browser): bigger covers so a card doesn't look
-   empty. */
+/* desktop and PS5 browser: bigger covers, cards look empty otherwise */
 @media (min-width: 900px) {
   .game-card { padding: 18px 20px; }
   .cover { width: 104px; height: 104px; border-radius: 14px; font-size: 22px; }
@@ -1056,14 +1047,13 @@ pre {
 @media (max-width: 720px) {
   .main { padding: 18px 16px 40px; }
   .brand span { display: none; }
-  .nav-link span { display: none; }   /* icon-only nav on small screens */
+  .nav-link span { display: none; }
   .nav-link { min-width: 44px; justify-content: center; padding: 0; }
   h1 { font-size: 22px; }
   .toolbar { grid-template-columns: 1fr; }
   .segmented { overflow-x: auto; }
   .segmented button { flex: 0 0 auto; }
-  /* The card body's parts join the card's grid, so the versions and notes
-     use the full width under the cover instead of a narrow column. */
+  /* body joins the card grid so versions and notes get the full width */
   .card-row { grid-template-columns: auto minmax(0, 1fr); column-gap: 14px; row-gap: 10px; }
   .card-body { display: contents; }
   .lead { grid-row: span 2; }

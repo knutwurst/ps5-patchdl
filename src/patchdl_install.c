@@ -26,10 +26,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
-/* AppInstUtil structs/signatures, reverse-engineered by the PS5 homebrew
-   scene (notmaj0r/CheatRunner, ps5-payload-dev/websrv). Sizes per CheatRunner:
-   CONTENTID=0x30, PLAYGOSCENARIOID=3, LANGUAGE=8, NUM_LANGUAGES=30, NUM_IDS=64.
-   The trailing `unknown` padding makes the playgo struct safely large. */
+/* AppInstUtil layouts from CheatRunner and ps5-payload-dev/websrv */
 #define AI_CONTENTID_SIZE        0x30
 #define AI_PLAYGOSCENARIOID_SIZE 3
 #define AI_LANGUAGE_SIZE         8
@@ -49,10 +46,8 @@ typedef struct {
     const char *content_id;
     const char *content_name;
     const char *icon_url;
-    /* Sony reads past the six pointers. The 8 bytes after icon_url select the
-       install mode: 0 = plain install, other values take a patch/cancel path
-       that refuses with 0x80B2116F. Left as stack garbage they caused our
-       intermittent 0x80B2116F (measured by ps5upload on FW 13.60). */
+    /* Sony reads past icon_url: unknown_30 is the install mode, 0 = plain.
+       stack garbage here gave random 0x80B2116F (ps5upload, FW 13.60) */
     uint64_t    unknown_30;
     uint64_t    reserved[7];
 } ai_meta_info_t;
@@ -82,13 +77,11 @@ typedef struct {
     ai_install_error_t error_info;
     int32_t            local_copy_percent;
     bool               is_copy_only;
-    char               _pad[2048]; /* safety margin — actual Sony struct may be larger */
+    char               _pad[2048]; /* Sony's real struct may be bigger */
 } ai_install_status_t;
 
-/* Padded buffers for Sony output writes whose actual size is reverse-engineered.
-   The visible content fits in 0x30 (content_id) / 16 (title_id) bytes, but the
-   firmware may NUL-pad or write more. Used as caller-side temporaries that are
-   then copy_bounded()-d into the right-sized destination. */
+/* out buffers for Sony calls without a length arg. ids fit in 0x30 / 16, but
+   who knows how much it pads. copy_bounded() into the real target after */
 #define AI_CONTENTID_OUT_SIZE    256
 #define AI_TITLEID_OUT_SIZE      128
 
@@ -100,7 +93,7 @@ STATIC_ASSERT(offsetof(ai_meta_info_t, uri) == 0, meta_uri_offset);
 STATIC_ASSERT(offsetof(ai_meta_info_t, icon_url) == (5 * sizeof(void *)),
               meta_icon_offset);
 
-/* Sysmodule IDs (from ps5-payload-dev/sdk crt/rtld_sprx.c). */
+/* from ps5-payload-dev/sdk crt/rtld_sprx.c */
 #define SYSMOD_IPMI           0x8000001d
 #define SYSMOD_USERSERVICE    0x80000011
 #define SYSMOD_SYSTEMSERVICE  0x80000010
@@ -122,17 +115,9 @@ static ai_title_from_pkg_fn   ai_title_from_pkg;
 static ai_content_from_pkg_fn ai_content_from_pkg;
 static ai_get_status_fn       ai_get_status;
 
-/* Resolve + initialize the AppInstUtil backend WITHOUT linking the sce libs
-   (that makes the ELF unloadable by the elfldr) and WITHOUT raw
-   sceKernelLoadStartModule (that wedged the process). Instead use the proper
-   sysmodule loader — the same path the SDK's rtld_sprx takes — then resolve
-   symbols via the kernel dynlib helpers. Runs in a detached thread; the HTTP
-   handler reports the stage and never blocks.
-   stage: 0 idle, 1 resolve loader, 2 load modules, 3 resolve symbols,
-   4 initialize, 5 ready, negative = failure at that step.
-   Stored as _Atomic so the worker's release-store and the request handlers'
-   acquire-loads pair properly — the function pointers they read after
-   stage==5 must not be reordered ahead of the stage check. */
+/* no sce lib linking (elfldr refuses the ELF), no raw sceKernelLoadStartModule
+   (wedged the process, ask me how I know). sysmodule loader + dlsym instead.
+   g_stage 1-4 = step, 5 = ready, <0 = failed. atomic: 5 means fn ptrs set */
 static _Atomic int     g_stage;
 static _Atomic int     g_err;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -187,9 +172,7 @@ copy_bounded(char *dst, size_t dst_sz, const char *src, size_t src_sz) {
     dst[n] = '\0';
 }
 
-/* Conservative whitelist for ids/filenames that we extract from a local path
-   and inject into URIs/log lines passed to AppInstUtil. Rejects CRLF, '/',
-   '\\', NUL, control chars, anything that could change URI semantics. */
+/* these end up in the HTTP request line of Sony's installer: no CRLF, no '/' */
 static int
 install_id_safe(const char *s) {
     if (!s || !s[0]) return 0;
@@ -203,9 +186,7 @@ install_id_safe(const char *s) {
     return 1;
 }
 
-/* Exact match for PS4/PS5 title ids (9 chars: 4 letters + 5 digits). A bare
-   strncmp(...,9) would also match longer ids that share a 9-char prefix and
-   could collide PPSA12345 with PPSA12345EVIL. */
+/* exactly 9 chars, so PPSA12345EVIL doesn't pass for PPSA12345 */
 static int
 title_id_eq9(const char *a, const char *b) {
     if (!a || !b) return 0;
@@ -233,16 +214,13 @@ remember_install(const char *target_title_id, const char *method,
     pthread_mutex_unlock(&g_mtx);
 }
 
-/* Resolve (dlsym, never call) a list of candidate patch-install symbols and
-   record which exist. Runs inside the backend thread, where the AppInstUtil
-   module is already loaded — the same proven-safe context as the normal symbol
-   resolution. No sysmod_load and no calls, so it is side-effect free. */
+/* dlsym only, nothing gets called. backend thread, module already loaded */
 static void
 fill_probe(void) {
     static const char *ai_syms[] = {
         "sceAppInstUtilInitialize",
         "sceAppInstUtilAppInstallPkg",
-        "sceAppInstUtilAppInstallTitleDir",     /* takes an explicit title id */
+        "sceAppInstUtilAppInstallTitleDir",
         "sceAppInstUtilAppInstallAll",          /* tile fallback on 13.xx */
         "sceAppInstUtilInstallByPackage",
         "sceAppInstUtilInstallByPackageEx",
@@ -295,8 +273,7 @@ fill_probe(void) {
     }
     snprintf(out + n, sz - n, "}}");
 
-    /* Publish atomically: the getter runs on an MHD worker thread and reads
-       g_probe_json under the same lock, so it never sees a half-built buffer. */
+    /* MHD getter reads under the lock, never sees half a buffer */
     pthread_mutex_lock(&g_mtx);
     memcpy(g_probe_json, tmp, sizeof(g_probe_json));
     pthread_mutex_unlock(&g_mtx);
@@ -313,8 +290,7 @@ backend_init_thread(void *arg) {
     if (!sysmod_load) { g_stage = -1; return NULL; }
 
     g_stage = 2;
-    /* Dependencies first, then AppInstUtil. The sysmodule loader pulls in
-       further deps and is the non-wedging path. */
+    /* deps first */
     sysmod_load(SYSMOD_IPMI);
     sysmod_load(SYSMOD_USERSERVICE);
     sysmod_load(SYSMOD_SYSTEMSERVICE);
@@ -335,7 +311,6 @@ backend_init_thread(void *arg) {
     ai_get_status         = (ai_get_status_fn)dynsym("libSceAppInstUtil.sprx",
                                                      "sceAppInstUtilGetInstallStatus");
 
-    /* Read-only feasibility probe — module is loaded, safe context. */
     fill_probe();
 
     if (!ai_initialize || !ai_install_pkg || !ai_install_by_package) {
@@ -366,9 +341,7 @@ backend_start(void) {
     pthread_mutex_unlock(&g_mtx);
 }
 
-/* Start the backend if needed and give it up to 15 s to come up (it loads a
-   system module and resolves symbols in its own thread), so an install
-   request right after startup doesn't fail just because it was early. */
+/* up to 15 s, so an install right after startup doesn't fail for being early */
 static void
 backend_wait(void) {
     backend_start();
@@ -402,9 +375,7 @@ patchdl_install_backend_check(char *msg, size_t msg_sz) {
     return (s == 5) ? 0 : -1;
 }
 
-/* Public getter: trigger the backend (which fills the probe in its own thread)
-   and return the cached result. Runs from the MHD worker thread, so it only
-   reads the cached string — it never loads modules or resolves symbols here. */
+/* MHD worker: only hands out the cached probe, the backend thread fills it */
 int
 patchdl_install_api_probe(char *out, size_t out_sz) {
     int ready;
@@ -423,15 +394,12 @@ patchdl_install_api_probe(char *out, size_t out_sz) {
     return -1;
 }
 
-/* Read-only: report the .pkg's embedded content id + title id (and whether it
-   is a full app vs a patch). No install, no side effects. 0 if anything read. */
 int
 patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz,
                          char *title_id, size_t tid_sz, int *is_app,
                          char *msg, size_t msg_sz) {
     char        sdk_path[1024];
-    /* Padded output buffers — Sony's GetContentIdFromPkg / GetTitleIdFromPkg
-       take no length hint; firmware may NUL-pad more than the visible id. */
+    /* Get*IdFromPkg take no length */
     char        cid[AI_CONTENTID_OUT_SIZE] = {0};
     char        tid[AI_TITLEID_OUT_SIZE]   = {0};
     int         app_c = 0, app_t = 0, ok = 0;
@@ -502,9 +470,7 @@ patchdl_install_status_json(char *out, size_t out_sz) {
     char tid[32];
     char method[32];
     int  start_rc;
-    /* ai_install_status_t carries a 2 KB safety pad; live on the heap so
-       a frequently-polled /api/installstatus doesn't keep committing pages
-       on every MHD worker's stack. */
+    /* heap: 2 KB pad, polled a lot, keep it off the MHD worker stacks */
     ai_install_status_t *st = NULL;
     char status[17], src_type[9];
     int  rc;
@@ -550,14 +516,12 @@ patchdl_install_status_json(char *out, size_t out_sz) {
         return -1;
     }
 
-    /* sceAppInstUtilGetInstallStatus(char *content_id_out, status_t *status):
-       first arg is an OUTPUT buffer that receives the current install's content_id.
-       Do NOT pass `cid` there — it would be overwritten. The visible id fits in
-       0x30 bytes but Sony's NUL-pad length is unknown; use a padded buffer. */
+    /* first arg is an out buffer (running install's content_id). passing cid
+       would clobber it */
     {
         char ai_cid_out[AI_CONTENTID_OUT_SIZE] = {0};
         rc = ai_get_status(ai_cid_out, st);
-        (void)ai_cid_out; /* returned content_id for future use */
+        (void)ai_cid_out;
     }
     copy_bounded(status, sizeof(status), st->status, sizeof(st->status));
     copy_bounded(src_type, sizeof(src_type), st->src_type, sizeof(st->src_type));
@@ -611,20 +575,15 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         return -1;
     }
 
-    /* Sony's installer sees the user partition as /user/data, not /data, and
-       PATH-ALLOWLISTS the URI passed to InstallByPackage: /user/data/ and
-       /mnt/usb are accepted, but a bare /data/... path is REJECTED with
-       0x80B2116F (empirically confirmed by the ps5upload project). So feed the
-       /user/data view of the file to both InstallByPackage and AppInstallPkg. */
+    /* the installer allowlists /user/data/ and /mnt/usb. plain /data/ gets
+       0x80B2116F (ps5upload found that one) */
     if (!strncmp(local_path, "/data/", 6))
         snprintf(sdk_path, sizeof(sdk_path), "/user%s", local_path);
     else
         snprintf(sdk_path, sizeof(sdk_path), "%s", local_path);
 
-    /* Diagnostic guard: Sony sometimes stores one patch byte stream under a
-       master title id while the version.xml targets a regional title id. That
-       is valid only when the caller supplies target metadata, so do not feed
-       such packages to the raw AppInstallPkg path. */
+    /* Sony sometimes keeps a regional patch under a master title id. only ok
+       with a target content id, refused otherwise */
     if (storage_title_id && storage_title_id[0] &&
         expected_title_id && expected_title_id[0] &&
         !title_id_eq9(storage_title_id, expected_title_id)) {
@@ -633,8 +592,6 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         pkg_tid[sizeof(pkg_tid) - 1] = '\0';
     }
     if (ai_title_from_pkg && expected_title_id && expected_title_id[0]) {
-        /* Sony's GetTitleIdFromPkg writes into the output buffer with no length
-           hint — pad generously and copy the safe portion into pkg_tid. */
         char tid_out[AI_TITLEID_OUT_SIZE] = {0};
         int  is_app = 0;
         if (ai_title_from_pkg(sdk_path, tid_out, &is_app) == 0 && tid_out[0]) {
@@ -649,11 +606,6 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                  pkg_tid, expected_title_id);
         return -1;
     }
-    /* Preferred path: etaHEN's DPI uses InstallByPackage with the installed
-       game's content_id in MetaInfo so AppInstUtil binds the install to the
-       right title slot. For shared-master cross-region packages the pkg bytes
-       carry a different title id than the installed game; passing content_id
-       is what etaHEN does to route the install correctly. */
     {
         char              file_uri[1100];
         char              http_loop_uri[1200] = {0};
@@ -661,8 +613,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         const char       *uris[4];
         ai_meta_info_t    meta    = {0};
         ai_pkg_info_t     pkg     = {0};
-        /* playgo is 0x2700 bytes — too big for the MHD worker stack alongside
-           uris, meta, pkg, resp buffers, and Sony's own frame use. */
+        /* 0x2700 bytes, too much for the MHD worker stack */
         ai_playgo_info_t *playgo  = calloc(1, sizeof(*playgo));
         int               rc2     = -1;
         const char       *title_dir;
@@ -684,9 +635,6 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
             if (tlen > 0 && tlen < sizeof(title_id)) {
                 char ip[INET_ADDRSTRLEN] = {0};
                 memcpy(title_id, t, tlen);
-                /* CRLF/path-injection guard: anything we splice into the loop /
-                   LAN URI lands inside Sony's HTTP request line. Reject ids
-                   or filenames carrying delimiters or control chars. */
                 if (install_id_safe(title_id) && install_id_safe(file_base + 1)) {
                     snprintf(http_loop_uri, sizeof(http_loop_uri),
                              "http://127.0.0.1:%d/api/pkg/%s/%s",
@@ -699,16 +647,15 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                 }
             }
         }
-        /* Stream install first: Sony's installer pulls the package from our
-           own /api/pkg over HTTP (ranges), the route that writes the content.
-           The bare path forms come last. */
+        /* HTTP first: the installer pulls ranges from /api/pkg, and that's
+           the route that really writes content. bare paths last */
         uris[0]                 = http_loop_uri[0] ? http_loop_uri : NULL;
         uris[1]                 = http_lan_uri[0] ? http_lan_uri : NULL;
         uris[2]                 = sdk_path;      /* /user/data/... */
         uris[3]                 = file_uri;       /* file:///user/data/... */
         meta.ex_uri             = "";
         meta.playgo_scenario_id = "";
-        /* Empty: the installer takes the id from the package itself. */
+        /* empty like etaHEN's DPI, the installer takes the pkg's own id */
         meta.content_id         = "";
         meta.content_name       = "PatchDL";
         meta.icon_url           = "";
@@ -742,9 +689,8 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         free(playgo);
     }
 
-    /* No AppInstallPkg fallback: it returns 0 and writes only the app
-       metadata (version, tile) without installing any content, which shows
-       up as "updated" while the game still runs the old version. */
+    /* no AppInstallPkg fallback: returns 0, writes only metadata (version,
+       tile) and no content. looks updated, isn't */
     snprintf(msg, msg_sz, "install rejected (InstallByPackage=0x%08x)", (unsigned)rc);
     return rc ? rc : -1;
 }
@@ -791,8 +737,6 @@ patchdl_install_by_uri(const char *uri, const char *target_title_id,
     return rc;
 }
 
-/* Direct AppInstallPkg call for a local path — bypasses MetaInfo, lets
-   AppInstUtil read the PKG's own embedded metadata to determine the target. */
 int
 patchdl_install_app_pkg(const char *local_path,
                         const char *expected_title_id,

@@ -15,75 +15,61 @@ typedef struct {
     char  *data;
     size_t size;
     size_t cap;
-    size_t max;     /* 0 = unbounded (legacy). Otherwise write_cb fails past this. */
+    size_t max;     /* 0 = no cap, else write_cb fails past it */
 } patchdl_buf_t;
 
 patchdl_buf_t *patchdl_buf_new(void);
 void           patchdl_buf_free(patchdl_buf_t *b);
 
-/* Call once, single-threaded, before any concurrent download worker starts /
-   after they have all joined. curl's global/OpenSSL init is otherwise lazy and
-   races across threads. */
+/* single-threaded only, before the workers start / after they joined.
+   curl's lazy global init races otherwise */
 void patchdl_net_global_init(void);
 void patchdl_net_global_cleanup(void);
 
 int patchdl_http_get(const char *url, patchdl_buf_t *out);
 
-/* External-host variants: no Sony CA pinning, no Sony host allowlist.
-   SSL peer verification is disabled (PS5 has no system CA store; these
-   are used for public metadata only, never for sensitive data). */
+/* non-Sony hosts: no allowlist, no cert check at all (no CA store on the
+   PS5). public metadata only, never anything sensitive */
 int patchdl_http_get_external(const char *url, patchdl_buf_t *out);
 int patchdl_http_post_external(const char *url, const char *content_type,
                                const char *body, patchdl_buf_t *out);
 
-/* ---- parallel piece download (used by the connection pool) ------------- */
-
-/* One piece of a split manifest package. `url` is heap-allocated. */
+/* url is heap-allocated */
 typedef struct {
     char     *url;
-    long long offset;     /* byte offset of this piece in the assembled file */
-    long long size;       /* exact length of this piece */
-    char      hash[80];   /* manifest hash hex (SHA-256, or SHA-1 for PS4), or "" */
+    long long offset;     /* in the assembled file */
+    long long size;
+    char      hash[80];   /* hex, SHA-256 (SHA-1 on PS4) or "" */
 } patchdl_piece_t;
 
 typedef struct {
     patchdl_piece_t *pieces;
     int              count;
-    long long        total;   /* assembled file size = sum of piece sizes */
+    long long        total;   /* sum of piece sizes */
     char             crc_url[768]; /* playgoChunkCrcUrl, or "" */
 } patchdl_manifest_t;
 
-/* Fetch + parse a Sony JSON manifest into a validated, contiguously-tiled
-   piece list. Returns 0 on success (caller frees with patchdl_manifest_free),
-   -1 on fetch/parse/tiling failure. */
+/* pieces are checked to tile the file without gaps.
+   free with patchdl_manifest_free */
 int  patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out);
 
-/* Why this thread's last patchdl_http_get / patchdl_fetch_manifest failed:
-   step is "" on success, else e.g. "dns", "connect", "tls", "network",
-   "timeout", "redirect", "http_status", "bad_manifest". curl_rc and
-   http_code as seen. */
+/* per thread: why the last get/fetch_manifest failed. step "" on success,
+   else "dns", "connect", "tls", "timeout", "bad_manifest" and friends */
 void patchdl_http_last_error(char *step, size_t step_sz, int *curl_rc, long *http_code);
 
 void patchdl_manifest_free(patchdl_manifest_t *m);
 
 
-/* Live state shared with one in-flight piece download. The worker owns these;
-   the curl callbacks read `abort` (set elsewhere) and publish progress into
-   `bytes_slot` (single-writer per worker slot). */
+/* owned by the worker. bytes_slot has a single writer, abort is set from
+   outside */
 typedef struct {
-    volatile long long *bytes_slot;  /* bytes written so far for this piece */
-    volatile int       *abort;       /* non-zero -> stop this transfer */
+    volatile long long *bytes_slot;  /* bytes of this piece on disk */
+    volatile int       *abort;
 } patchdl_piece_ctx_t;
 
-/* Download one whole piece and pwrite it into `fd` at `file_offset`. Concurrent
-   non-overlapping pieces of the same fd are safe. With resume_from > 0 the
-   first resume_from bytes are already on disk and only the rest is asked
-   for (a server that sends the whole piece anyway just overwrites it).
-   Returns 0 on success (and fdatasyncs fd), -1 on network/IO/abort (the
-   bytes written so far are in *ctx->bytes_slot), -2 on a SHA-256 mismatch,
-   -3 when the server can't continue at resume_from (start the piece over).
-   `curl_rc_out`/`http_code_out` (either may be NULL) receive the last libcurl
-   CURLcode + HTTP status for failure diagnosis. */
+/* pwrite-based, so parallel pieces on one fd are fine. 0 ok (fdatasynced),
+   -1 network/io/abort (partial kept), -2 hash mismatch, -3 server can't
+   resume there, start the piece over */
 int patchdl_http_download_piece(const char *url, int fd,
                                 long long file_offset, long long file_size,
                                 long long resume_from,
@@ -91,32 +77,25 @@ int patchdl_http_download_piece(const char *url, int fd,
                                 patchdl_piece_ctx_t *ctx,
                                 int *curl_rc_out, long *http_code_out);
 
-/* Read-only: hash a [offset, offset+size) region of fd into out_hex
-   (caller provides >= 65 bytes), SHA-1 if like_hex has 40 hex digits (PS4
-   manifests), else SHA-256. Returns 0 on success. */
+/* out_hex needs 65 bytes. SHA-1 if like_hex is 40 digits (PS4), else
+   SHA-256 */
 int patchdl_hash_fd_region(int fd, long long offset, long long size,
                            const char *like_hex, char *out_hex);
 
-/* Progress callback. Return non-zero to ABORT the in-flight download (used to
-   cancel large patch downloads); return 0 to continue. */
+/* non-zero return cancels the download */
 typedef int (*patchdl_download_progress_cb)(void *ctx,
                                             long long downloaded,
                                             long long total);
 
-/* Stream a URL to a file on disk (for large PKG downloads). Returns 0 on
-   success and writes the byte count to *bytes_out. */
 int patchdl_http_download(const char *url, const char *dest_path,
                           long long *bytes_out);
 int patchdl_http_download_progress(const char *url, const char *dest_path,
                                    long long *bytes_out,
                                    patchdl_download_progress_cb cb, void *ctx);
 
-/* Download a Sony JSON package manifest by concatenating every entry in
-   "pieces" into one installable PKG. When `verify` is non-zero each piece is
-   checked against its manifest SHA-256 (a mismatch returns -2). When `resume`
-   is non-zero an existing partial at dest_path is kept: fully-downloaded pieces
-   are skipped and only the remainder is fetched (survives a reboot). On any
-   failure the partial is left in place for a later resume. */
+/* glues all pieces into one pkg. verify: -2 on a hash mismatch. resume:
+   keep the partial at dest_path and only fetch what's missing. the partial
+   stays on failure */
 int patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                    long long *bytes_out);
 int patchdl_http_download_manifest_progress(const char *manifest_url,
@@ -125,6 +104,5 @@ int patchdl_http_download_manifest_progress(const char *manifest_url,
                                             patchdl_download_progress_cb cb,
                                             void *ctx, int verify, int resume);
 
-/* Diagnostic: run the GET pipeline for `url` and write a JSON report
-   (dns result/ip, curl code, http status, bytes) into `out_json`. */
+/* JSON report of dns + one GET, for /api/netcheck */
 void patchdl_net_diag(const char *url, char *out_json, size_t sz);

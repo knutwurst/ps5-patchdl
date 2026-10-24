@@ -37,10 +37,8 @@ lookup_tsv(const char *title_id, char *url_out, size_t url_sz) {
             fclose(fp);
             return -1;
         }
-        /* Defense in depth: the TSV file lives under /data/patchdl, writable
-           by anyone with /data access. patchdl_http_get also enforces
-           host_allowed, but rejecting non-https / non-Sony schemes here means
-           a poisoned line can't even reach the network layer. */
+        /* anyone with /data access can edit the TSV. host_allowed checks
+           later too, but drop non-https lines right here */
         if (strncmp(url, "https://", 8) != 0) {
             fclose(fp);
             return -1;
@@ -53,9 +51,8 @@ lookup_tsv(const char *title_id, char *url_out, size_t url_sz) {
     return -1;
 }
 
-/* PS4 titles: Sony's update list lives at a path derived from the title id
-   with HMAC-SHA256 under a key that is part of the PS4 system software and
-   widely published (it's how every PS4 update checker finds patches). */
+/* PS4 ver.xml path is HMAC-SHA256("np_" + title id). public key from the
+   PS4 system software, every update checker uses it */
 static const unsigned char PS4_UPDATE_KEY[32] = {
     0xAD, 0x62, 0xE3, 0x7F, 0x90, 0x5E, 0x06, 0xBC, 0x19, 0x59, 0x31, 0x42,
     0x28, 0x1C, 0x11, 0x2C, 0xEC, 0x0E, 0x7E, 0xC3, 0xE9, 0x7E, 0xFD, 0xCA,
@@ -90,7 +87,6 @@ patchdl_resolve_url(const char *title_id, char *url_out, size_t url_sz) {
     if (!strncmp(title_id, "CUSA", 4))
         return ps4_update_url(title_id, url_out, url_sz);
 
-    /* Only PS5 native title IDs (PPSA/PPSE/PPSH/PPSJ/PPSC) */
     if (strncmp(title_id, "PPSA", 4) &&
         strncmp(title_id, "PPSE", 4) &&
         strncmp(title_id, "PPSH", 4) &&

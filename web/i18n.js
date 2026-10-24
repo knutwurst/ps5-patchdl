@@ -1,10 +1,7 @@
-// UI translations. Each language is one flat dictionary; a missing key falls
-// back to English, then to the key itself. {name} placeholders are replaced
-// from the vars passed to t(). Some strings carry inline markup (<b>, <i>)
-// because they are inserted as HTML; keep it when translating.
+// one flat dict per language, missing keys fall back to English, then the key.
+// some strings go in as HTML, keep the <b>/<i> when translating
 const I18N = {
   en: {
-    // ---- navigation / rail ----
     "nav.label": "Navigation",
     "nav.sections": "Sections",
     "nav.games": "Games",
@@ -15,7 +12,6 @@ const I18N = {
     "rail.freeUnknown": "-- free",
     "donate.button": "Buy me a coffee",
 
-    // ---- games view ----
     "games.eyebrow": "PS5 & PS4 game updates",
     "games.title": "Games",
     "games.updateAll": "Update all",
@@ -30,7 +26,6 @@ const I18N = {
     "filter.blocked": "Not supported",
     "filter.all": "All",
 
-    // ---- status strip ----
     "status.label": "System status",
     "metric.firmware": "Firmware",
     "metric.firmwareBuild": "System version",
@@ -42,7 +37,6 @@ const I18N = {
     "metric.downloadTarget": "Download target",
     "metric.downloadsManage": "{size} in downloads · manage",
 
-    // ---- global download banner ----
     "dl.downloading": "Downloading",
     "dl.queued": "Queued",
     "dl.verifying": "Verifying",
@@ -50,7 +44,6 @@ const I18N = {
     "dl.waiting": "waiting",
     "dl.fetchingManifest": "fetching manifest…",
 
-    // ---- game card ----
     "pill.queued": "Queued",
     "pill.downloading": "Downloading",
     "pill.paused": "Paused",
@@ -80,7 +73,6 @@ const I18N = {
     "card.pausedDownloaded": "Paused — <b>{size}</b> downloaded",
     "card.resumeToContinue": "Resume to continue",
 
-    // ---- card buttons ----
     "btn.installing": "Installing…",
     "btn.pause": "Pause",
     "btn.pauseHint": "Pause the download (keeps what was downloaded).",
@@ -99,7 +91,6 @@ const I18N = {
     "btn.cancel": "Cancel",
     "btn.cancelHint": "Stop and delete the download.",
 
-    // ---- progress ----
     "progress.queued": "Queued — waiting for a free slot",
     "progress.verifying": "Checking the package already on disk",
     "progress.retrying": "Connection interrupted, trying again…",
@@ -119,7 +110,6 @@ const I18N = {
     "fmt.etaMin": "{m}m {s}s",
     "fmt.etaHour": "{h}h {m}m",
 
-    // ---- other versions dialog ----
     "versions.title": "Other versions",
     "versions.loading": "Loading the version list…",
     "versions.loadFailed": "The version list couldn't be loaded. Try again in a moment.",
@@ -140,7 +130,6 @@ const I18N = {
     "card.lblUpdate": "Update",
     "card.lblNewest": "Newest",
 
-    // ---- download diagnosis dialog ----
     "common.close": "Close",
     "common.unknown": "unknown",
     "diag.eyebrow": "Download problem",
@@ -166,7 +155,6 @@ const I18N = {
     "diag.copied": "Report copied.",
     "qr.aria": "QR code",
 
-    // ---- donation dialog ----
     "donate.eyebrow": "Support PatchDL",
     "donate.title": "Buy me a coffee",
     "donate.why": "If you like what I do, you can buy me a coffee.",
@@ -174,7 +162,6 @@ const I18N = {
     "donate.open": "Open PayPal",
     "donate.small": "It doesn't have to be a generous donation. A few cents are enough to show me who is interested in further development. So the motivation stays and I just know that I am not programming for the bin ;)",
 
-    // ---- settings view ----
     "settings.eyebrow": "Policy",
     "settings.title": "Settings",
     "settings.save": "Save",
@@ -207,7 +194,6 @@ const I18N = {
     "settings.storage": "Downloads on console",
     "settings.donateText": "Like PatchDL? You can buy me a coffee.",
 
-    // ---- source types / install protection ----
     "source.official": "Official",
     "source.official.desc": "Native console installation",
     "source.external": "External",
@@ -223,7 +209,6 @@ const I18N = {
     "policy.downloadAllowed": "Download allowed",
     "policy.downloadBlocked": "Download blocked",
 
-    // ---- downloads on console ----
     "storage.state.complete": "Complete",
     "storage.state.paused": "Paused",
     "storage.state.downloading": "Downloading",
@@ -240,7 +225,6 @@ const I18N = {
     "storage.rel.newer": "newer than installed",
     "storage.rel.installed": "already installed",
 
-    // ---- logs view ----
     "logs.eyebrow": "Runtime",
     "logs.title": "Logs",
     "logs.clear": "Clear log",
@@ -259,7 +243,6 @@ const I18N = {
     "log.savedDisabled": "Saved: {id} disabled",
     "log.linkRefused": "{site} link for {id} refused: {why}",
 
-    // ---- toasts ----
     "toast.nameMessage": "{name}: {message}",
     "toast.demoData": "Demo data loaded. API is not reachable yet.",
     "toast.refreshed": "Data refreshed.",
@@ -285,7 +268,6 @@ const I18N = {
     "toast.downloadStarted": "{name}: download of {version} started.",
     "toast.linkReceived": "{name}: link received, download of {version} started.",
 
-    // ---- why a manifest fetch failed ----
     "failstep.dns": "Sony's download server couldn't be found (DNS). Is it blocked on your network?",
     "failstep.network": "Couldn't connect to Sony's download server. Is it blocked on your network?",
     "failstep.timeout": "Sony's download server didn't answer in time.",
@@ -297,7 +279,6 @@ const I18N = {
     "failstep.host_not_allowed": "The package is on a server PatchDL doesn't use.",
     "failstep.unknown": "Package list unavailable ({step}).",
 
-    // ---- server refusal reasons ----
     "reason.patch_title_mismatch": "Patch metadata targets a different title - install blocked.",
     "reason.install_not_allowed_for_source": "Install blocked for this source.",
     "reason.source_unknown": "Source unknown — blocked.",
@@ -328,7 +309,6 @@ const I18N = {
     "reason.noSpace": "Not enough space on the PS5: needs {need} plus 2 GB headroom, {free} free.",
     "reason.noSpaceInstall": "Not enough space to download and install this update: it needs about {need}, {free} is free. Free up space, or pick another download drive in Settings.",
 
-    // ---- older patch guide ----
     "guide.eyebrowOther": "Other version",
     "guide.eyebrowOld": "Old FW patch",
     "guide.title": "Get {version}",
@@ -364,10 +344,6 @@ const I18N = {
     "guide.note.error": "The download stopped. Resume it from the game in PatchDL.",
   },
 };
-
-// Choices for the language selector. A language without a dictionary yet
-// falls back to English.
-// Translations. Missing keys fall back to English (see t()).
 
 I18N["de"] = {
   "nav.label": "Navigation",
@@ -3327,7 +3303,7 @@ function savedLanguage() {
   }
 }
 
-// Map a browser language tag onto one of our language codes.
+// browser tag like pt-PT or zh-CN to a key of I18N
 function normalizeLanguage(tag) {
   const t = String(tag || "").toLowerCase();
   if (!t) return "";
@@ -3350,7 +3326,7 @@ function detectLanguage() {
 
 const CURRENT_LANG = detectLanguage();
 
-// The selector shows the saved choice even when no dictionary exists for it yet.
+// saved choice, even if there's no dictionary for it yet
 function languageChoice() {
   return savedLanguage() || "auto";
 }
@@ -3369,7 +3345,7 @@ function t(key, vars) {
   return s;
 }
 
-// English regardless of the chosen language (diagnostic report).
+// always English, for the diagnostic report
 function tEn(key, vars) {
   let s = key in I18N.en ? I18N.en[key] : key;
   if (vars) {
@@ -3399,6 +3375,6 @@ function setLanguage(code) {
   try {
     if (!code || code === "auto") localStorage.removeItem(LANG_STORAGE_KEY);
     else localStorage.setItem(LANG_STORAGE_KEY, code);
-  } catch (_) { /* storage blocked: the choice lasts until reload only */ }
+  } catch (_) { /* storage blocked, choice dies with the reload. oh well */ }
   location.reload();
 }

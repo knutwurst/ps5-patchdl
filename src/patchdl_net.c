@@ -30,23 +30,19 @@
 #include "patchdl_ca.h"
 #endif
 
-/* Manifest sanity caps — reject anything bigger than a real PS5 patch. The
-   largest title we've seen tops out around 70 GB / 18 pieces. */
+/* manifest sanity caps. biggest real one I've seen: ~70 GB in 18 pieces */
 #define PATCHDL_MAX_PIECES         4096
-#define PATCHDL_MAX_PIECE_BYTES    (8ULL  * 1024 * 1024 * 1024)   /* 8 GiB  */
-#define PATCHDL_MAX_TOTAL_BYTES    (200ULL * 1024 * 1024 * 1024)  /* 200 GiB */
+#define PATCHDL_MAX_PIECE_BYTES    (8ULL  * 1024 * 1024 * 1024)
+#define PATCHDL_MAX_TOTAL_BYTES    (200ULL * 1024 * 1024 * 1024)
 
-/* In-RAM buffer caps for full HTTP body fetches. version.xml is a few KB,
-   manifest JSON is a few MB at most — fail-closed beyond that. The
-   manifest cap is sized for ~4096 pieces × ~3 KB JSON each with plenty of
-   headroom; real PS5 manifests are 1-2 MB. */
+/* RAM caps for whole-body fetches. version.xml is a few KB, real
+   manifests 1-2 MB */
 #define PATCHDL_BUF_MAX_VERXML     (4   * 1024 * 1024)
 #define PATCHDL_BUF_MAX_MANIFEST   (16  * 1024 * 1024)
 
 #ifdef PATCHDL_HAVE_CURL
-/* Replacement for fopen("wb"/"r+b") that refuses to follow a symlink at the
-   destination (would let a malicious symlink redirect the download) and pins
-   the new file's mode to 0600. Returns NULL on any open error. */
+/* fopen without following symlinks, a planted link could redirect the
+   download. new files get 0600 */
 static FILE *
 fopen_safe(const char *path, int rw_existing) {
     int flags = O_CLOEXEC | O_NOFOLLOW;
@@ -55,7 +51,7 @@ fopen_safe(const char *path, int rw_existing) {
     FILE *fp;
     fd = open(path, flags, 0600);
     if (fd < 0) return NULL;
-    if (!(fp = fdopen(fd, rw_existing ? "r+b" : "wb"))) close(fd);   /* fdopen keeps no fd on failure */
+    if (!(fp = fdopen(fd, rw_existing ? "r+b" : "wb"))) close(fd);
     return fp;
 }
 #endif
@@ -70,17 +66,14 @@ static const char *ALLOWED_HOSTS[] = {
     NULL,
 };
 
-/* PS4 package manifests are published on gs2 over plain http only (https
-   there is a CloudFront edge without Sony's certificate). The console's own
-   installer checks the package signature, so a forged manifest can't get an
-   unsigned package installed. Everything else stays https-only. */
+/* PS4 manifests only exist over plain http on gs2 (its https is CloudFront
+   without Sony's cert). the installer checks the pkg signature anyway */
 #define PLAIN_HTTP_HOST "gs2.ww.prod.dl.playstation.net"
 
 static int
 host_allowed(const char *host) {
     size_t hlen = strlen(host);
-    /* DNS is case-insensitive; an upstream redirect to "SGST.prod..." would
-       otherwise drop out of the allowlist. */
+    /* case-insensitive, a redirect to "SGST.prod..." is still Sony */
     for (int i = 0; ALLOWED_HOSTS[i]; i++) {
         if (!strcasecmp(host, ALLOWED_HOSTS[i]))
             return 1;
@@ -93,9 +86,6 @@ host_allowed(const char *host) {
     return 0;
 }
 
-/* Extract hostname from https://host/path or http://host/path */
-/* Why the calling thread's last patchdl_http_get failed (or what status it
-   got), for error reports. */
 static _Thread_local struct {
     char step[24];
     int  curl_rc;
@@ -109,9 +99,8 @@ set_last(const char *step, int curl_rc, long http_code) {
     g_last.http_code = http_code;
 }
 
-/* CURLOPT_RESOLVE entries for host on 443 and 80 from PatchDL's own
-   resolver (patchdl_dns.c), with every address it found. NULL when the host
-   can't be resolved. */
+/* CURLOPT_RESOLVE for 443 and 80 from PatchDL's resolver, curl never asks
+   the console's DNS */
 static struct curl_slist *
 resolve_list_for(const char *host) {
     patchdl_dns_answer_t a;
@@ -131,11 +120,8 @@ resolve_list_for(const char *host) {
     return both;
 }
 
-/* The host's addresses refused, dropped or stalled the connection: the next
-   request asks DNS again instead of reusing the cached answer, so a CDN edge
-   that stopped serving this console is left behind. Includes a transfer that
-   stalled mid-way (low-speed timeout): the edges rotate within seconds, and
-   a fresh answer usually names other ones. */
+/* dead or stalled edge: ask DNS again, a fresh answer usually names
+   other edges */
 static void
 note_curl_result(const char *host, CURLcode res) {
     if (res == CURLE_COULDNT_CONNECT || res == CURLE_COULDNT_RESOLVE_HOST ||
@@ -151,8 +137,7 @@ patchdl_http_last_error(char *step, size_t step_sz, int *curl_rc, long *http_cod
     if (http_code) *http_code = g_last.http_code;
 }
 
-/* Manifest piece hashes: PS5 manifests carry SHA-256 (64 hex digits), PS4
-   manifests SHA-1 (40). */
+/* PS5 manifests use SHA-256, PS4 ones SHA-1 (40 hex digits) */
 static const EVP_MD *
 digest_for(const char *hex) {
     return (hex && strlen(hex) == 40) ? EVP_sha1() : EVP_sha256();
@@ -174,9 +159,8 @@ url_host(const char *url, char *out, size_t out_sz) {
     return 0;
 }
 
-/* The console's default socket receive buffer (64 KB) holds one connection
-   to ~11 MB/s; asking for more gets the system maximum (512 KB), which lets
-   a single connection reach ~45 MB/s. */
+/* the default 64 KB rcvbuf caps a connection at ~11 MB/s. asking for 4 MB
+   gets the system max (512 KB) and ~45 MB/s */
 #define PATCHDL_RCVBUF_BYTES (4 * 1024 * 1024)
 
 static int
@@ -184,20 +168,18 @@ sockopt_rcvbuf_cb(void *clientp, curl_socket_t fd, curlsocktype purpose) {
     int sz = PATCHDL_RCVBUF_BYTES;
     (void)clientp;
     if (purpose == CURLSOCKTYPE_IPCXN)
-        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);  /* best effort */
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     return CURL_SOCKOPT_OK;
 }
-
-/* ---------- HTTP GET via curl ------------------------------------------- */
 
 static size_t
 write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     patchdl_buf_t *b     = userdata;
     size_t         total = size * nmemb;
     char          *newp;
-    /* Overflow guard before the cap check (b->size+total may wrap on 32-bit). */
+    /* size + total can wrap on 32-bit */
     if (total > (size_t)-1 - b->size - 1) return 0;
-    /* Cap accumulation so a hostile CDN can't drive unbounded RAM growth. */
+    /* hostile server can't eat all the RAM */
     if (b->max && b->size + total > b->max) return 0;
     newp = realloc(b->data, b->size + total + 1);
     if (!newp) return 0;
@@ -215,12 +197,8 @@ patchdl_http_get(const char *url, patchdl_buf_t *out) {
     return http_get_once(url, out);
 }
 
-/* Manifests, fetched when a download starts: a request that failed on the
-   network is tried twice more after a short pause, each time starting at
-   another CDN address, so a single dropped connection doesn't fail the
-   download before its first byte. HTTP errors, TLS failures and refused
-   hosts are final. (Update lists aren't retried: the background check walks
-   every game and would crawl when an edge is dead.) */
+/* manifests only: network errors get two more tries on other edges.
+   update lists don't retry, the background check would crawl */
 static int
 http_get_retrying(const char *url, patchdl_buf_t *out) {
     static const unsigned pause_s[] = { 2, 5 };
@@ -267,8 +245,7 @@ http_get_once(const char *url, patchdl_buf_t *out) {
     curl = curl_easy_init();
     if (!curl) { curl_slist_free_all(resolve_list); return -1; }
 
-    /* Trust only the embedded SCEI DNAS Root (Sony's private CDN CA).
-       CAINFO_BLOB keeps the cert in memory — no file written anywhere. */
+    /* trust only the embedded SCEI root */
     ca_blob.data  = (void *)PATCHDL_SCEI_DNAS_ROOT_PEM;
     ca_blob.len   = strlen(PATCHDL_SCEI_DNAS_ROOT_PEM);
     ca_blob.flags = CURL_BLOB_COPY;
@@ -280,17 +257,13 @@ http_get_once(const char *url, patchdl_buf_t *out) {
     curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB,     &ca_blob);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,  1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,  2L);
-    /* Some Sony CDN edges still serve SHA-1-signed leaf certs, which
-       OpenSSL 3.x rejects at the default security level. Lower it so the
-       chain still verifies against the pinned SCEI root. */
+    /* some edges still serve SHA-1 signed certs. in 2026. OpenSSL 3 refuses
+       them at the default level, the chain is still checked against the root */
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,         15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       3L);
-    /* Redirects must stay on HTTPS — host_allowed gates the initial URL, but
-       once libcurl follows a 302 we want the protocol pinned too. The _STR
-       variants replaced the bitfield options in libcurl 7.85. Plain http only
-       for the PS4 manifest host (see PLAIN_HTTP_HOST). */
+    /* redirects stay on https, plain http only for PLAIN_HTTP_HOST */
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       plain ? "http" : "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
@@ -303,7 +276,7 @@ http_get_once(const char *url, patchdl_buf_t *out) {
     curl_slist_free_all(resolve_list);
 
     if (res != CURLE_OK) {
-        /* only "connect", "timeout" and "network" are worth another try */
+        /* http_get_retrying retries connect, timeout and network */
         set_last(res == CURLE_COULDNT_CONNECT ? "connect" :
                  res == CURLE_PEER_FAILED_VERIFICATION ||
                  res == CURLE_SSL_CONNECT_ERROR ? "tls"
@@ -320,8 +293,6 @@ http_get_once(const char *url, patchdl_buf_t *out) {
     set_last(http_code >= 400 ? "http_status" : "", 0, http_code);
     return 0;
 }
-
-/* ---------- external-host HTTP (no Sony CA, no allowlist) -------------- */
 
 static int
 http_external(const char *url, const char *method,
@@ -402,11 +373,10 @@ patchdl_http_post_external(const char *url, const char *content_type,
     return http_external(url, "POST", content_type, body, out);
 }
 
-/* Write sink: tees the body to the file and, when verifying, into a running
-   SHA-256. curl always calls with size==1, so nmemb is the byte count. */
+/* file plus running hash when verifying */
 typedef struct {
     FILE       *fp;
-    EVP_MD_CTX *md;   /* NULL when not verifying */
+    EVP_MD_CTX *md;
 } write_sink_t;
 
 static size_t
@@ -418,7 +388,6 @@ file_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return written;
 }
 
-/* Hex-encode a digest, lowercase. */
 static void
 hex_encode(const unsigned char *d, unsigned int len, char *out, size_t out_sz) {
     static const char hexd[] = "0123456789abcdef";
@@ -448,16 +417,12 @@ curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     if (!p || !p->cb) return 0;
 
     total = p->total > 0 ? p->total : (long long)dltotal;
-    /* A non-zero return aborts the transfer (CURLE_ABORTED_BY_CALLBACK),
-       which is how a cancel request stops a piece mid-flight. */
+    /* non-zero aborts the transfer, that's how cancel works */
     return p->cb(p->ctx, p->base + (long long)dlnow, total);
 }
 
-/* Returns 0 on success, -1 on download/network failure, -2 when an expected
-   SHA-256 was given and the downloaded bytes did not match it, -3 when a byte
-   range was requested (range_start>0) but the server ignored it (no HTTP 206).
-   When range_start>0 the body is appended at the file's current position, so
-   the caller must have it positioned at range_start and must not verify. */
+/* -2 hash mismatch, -3 range ignored (no 206). with range_start > 0 the
+   body is appended at the current position and can't be verified */
 static int
 http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
                                progress_state_t *progress,
@@ -506,17 +471,13 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
-    /* HTTPS pin removed on the streaming download path: the Sony CDN sometimes
-       302s a piece URL to a signed http:// edge inside its own infrastructure,
-       and refusing those redirects was breaking real-world downloads.
-       host_allowed + TLS-against-pinned-root on every leg already gate the
-       hosts we'll talk to. NOSIGNAL stays — it protects the worker from a
-       SIGPIPE on connection RST. */
+    /* no https pin on redirects here, the CDN sometimes 302s a piece to a
+       signed http:// URL. NOSIGNAL keeps a RST from SIGPIPEing the worker */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
-    /* an error page (404, 503) must not be saved as the file */
+    /* a 404 page makes a lousy patch */
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
-    /* No total timeout (patches can be large); abort only on a long stall. */
+    /* no total timeout, only stalls abort */
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
@@ -542,8 +503,6 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
         if (sink.md) EVP_MD_CTX_free(sink.md);
         return -1;
     }
-    /* Asked for a byte range but the server sent the whole file (no 206): the
-       caller must drop the piece and re-fetch it whole. */
     if (range_start > 0 && http_code != 206) {
         if (sink.md) EVP_MD_CTX_free(sink.md);
         return -3;
@@ -555,12 +514,10 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
         char          hex[2 * EVP_MAX_MD_SIZE + 1];
         int           ok = EVP_DigestFinal_ex(sink.md, dig, &dlen);
         EVP_MD_CTX_free(sink.md);
-        /* Fail-closed on a digest API failure — otherwise hex would be empty
-           and we'd silently report -2 with no diagnostic. */
         if (ok != 1 || dlen == 0) return -2;
         hex_encode(dig, dlen, hex, sizeof(hex));
         if (strcasecmp(hex, expected_sha256_hex) != 0)
-            return -2;          /* integrity mismatch */
+            return -2;
     }
 
     if (bytes_out) *bytes_out = (long long)dl;
@@ -577,7 +534,7 @@ patchdl_http_download_progress(const char *url, const char *dest_path,
 
     if (!fp) return -1;
     rc = http_download_to_file_progress(url, fp, bytes_out, &progress, NULL, 0);
-    if (fclose(fp) != 0 && !rc) rc = -1;   /* the last flush failed (disk full) */
+    if (fclose(fp) != 0 && !rc) rc = -1;   /* last flush, disk full */
 
     if (rc) {
         unlink(dest_path);
@@ -592,8 +549,7 @@ patchdl_http_download(const char *url, const char *dest_path,
     return patchdl_http_download_progress(url, dest_path, bytes_out, NULL, NULL);
 }
 
-/* Substring scan bounded to [p, limit). NULL limit means search to NUL.
-   Returns NULL if needle is not found before limit. */
+/* NULL limit: search to the end */
 static const char *
 strstr_bounded(const char *p, const char *needle, const char *limit) {
     const char *hit = strstr(p, needle);
@@ -602,11 +558,8 @@ strstr_bounded(const char *p, const char *needle, const char *limit) {
     return hit;
 }
 
-/* Read "key": "value" starting from p. Search and read are bounded by `limit`
-   (pass NULL to search to end of buffer). Decodes \\ \" \/ \n \r \t \b \f; any
-   other \X is copied without the backslash. \uXXXX is left as the raw 6 bytes
-   (we don't need Unicode for manifest fields). limit==NULL keeps legacy
-   end-of-string scope for callers that don't need the cap. */
+/* minimal "key": "value" reader, enough for manifests. \u escapes are
+   not decoded */
 static int
 json_string_after(const char *p, const char *key, char *out, size_t out_sz,
                   const char *limit) {
@@ -641,7 +594,7 @@ json_string_after(const char *p, const char *key, char *out, size_t out_sz,
             case 't':  out[n++] = '\t'; break;
             case 'b':  out[n++] = '\b'; break;
             case 'f':  out[n++] = '\f'; break;
-            default:   out[n++] = *q;   break; /* unknown escape: keep payload */
+            default:   out[n++] = *q;   break;
             }
             q++;
         } else {
@@ -703,15 +656,11 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         free(manifest.data);
         return -1;
     }
-    /* Bound the scan to the pieces array; otherwise a later "url" key in the
-       manifest (e.g. playgoChunkCrcUrl) could be appended as a bogus piece. */
+    /* stop at the end of "pieces", a later "url" key isn't a piece */
     pieces_end = strchr(pieces, ']');
     json_u64_after(manifest.data, "originalFileSize", &manifest_total, NULL);
 
-    /* Resume: reopen the existing partial and keep its bytes; else start clean.
-       Fully-downloaded pieces are skipped; the one piece that was only partially
-       written continues mid-piece via an HTTP byte range (with a fall back to
-       re-fetching it whole if the CDN ignores the range). */
+    /* resume: skip complete pieces, continue the half one with a range */
     if (resume) {
         fp = fopen_safe(dest_path, 1);
         if (fp) { fseek(fp, 0, SEEK_END); have = ftell(fp); if (have < 0) have = 0; }
@@ -738,7 +687,6 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         json_u64_after(p, "fileSize", &expected, piece_limit);
         have_offset = (json_u64_after(p, "fileOffset", &offset, piece_limit) == 0);
 
-        /* Piece already fully present from a previous run: skip the download. */
         if (!started && have_offset && expected &&
             have >= (long long)(offset + expected)) {
             total = (long long)(offset + expected);
@@ -749,32 +697,30 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
             continue;
         }
 
-        /* First piece to (re)download while resuming. If part of it is already
-           on disk, resume WITHIN it with a byte range; otherwise drop any stray
-           bytes and fetch it whole. After this, every piece is fetched whole. */
+        /* first missing piece: range if part of it is on disk, else cut off
+           the stray bytes. all later pieces come whole */
         if (!started) {
             if (have_offset && expected && have > (long long)offset &&
                 have < (long long)(offset + expected)) {
-                range_start = have - (long long)offset;  /* this piece's bytes on disk */
-                fseek(fp, 0, SEEK_END);                   /* append at `have` */
+                range_start = have - (long long)offset;
+                fseek(fp, 0, SEEK_END);
                 total = have;
             } else {
                 long long start_at = have_offset ? (long long)offset : 0;
                 fflush(fp);
                 if (ftruncate(fileno(fp), (off_t)start_at) != 0)
-                    goto done;             /* can't resume cleanly; keep partial */
+                    goto done;             /* keep the partial */
                 fseek(fp, 0, SEEK_END);
                 total = start_at;
             }
             started = 1;
         }
 
-        /* Whole pieces are concatenated in array order; a ranged (partial) piece
-           starts mid-piece, so the contiguity guard applies only to whole ones. */
+        /* a ranged piece starts mid-piece, so only check whole ones */
         if (have_offset && range_start == 0 && offset != (unsigned long long)total)
             goto done;
 
-        /* A ranged piece can't be hashed (only its tail is fetched). */
+        /* only the tail of a ranged piece comes in, can't hash it */
         want_hash = NULL;
         if (range_start == 0 && verify) {
             json_string_after(p, "hashValue", hash, sizeof(hash), piece_limit);
@@ -785,11 +731,9 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
             progress_state_t progress = {
                 cb, ctx, total, manifest_total ? (long long)manifest_total : 0
             };
-            /* drc: 0 ok, -1 network/cancel, -2 SHA-256, -3 range ignored. */
             drc = http_download_to_file_progress(url, fp, &got, &progress,
                                                  want_hash, range_start);
             if (drc == -3) {
-                /* Server ignored the range: drop the piece and fetch it whole. */
                 fflush(fp);
                 if (ftruncate(fileno(fp), (off_t)offset) != 0)
                     goto done;
@@ -810,12 +754,10 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
             if (drc == -2) rc = -2;
             goto done;
         }
-        /* range_start + got = this piece's bytes now on disk. */
         if (expected && (unsigned long long)(range_start + got) != expected)
             goto done;
 
         total += got;
-        /* A non-zero callback return between pieces means cancel requested. */
         if (cb && cb(ctx, total, manifest_total ? (long long)manifest_total : total))
             goto done;
         count++;
@@ -830,8 +772,7 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
 done:
     fclose(fp);
     free(manifest.data);
-    /* Keep the partial on failure so it can be resumed; the caller deletes it
-       on cancel or on a corrupt-verify (-2). */
+    /* partial stays for a resume, the caller deletes it on cancel or -2 */
     return rc;
 }
 
@@ -842,24 +783,14 @@ patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                                   bytes_out, NULL, NULL, 0, 0);
 }
 
-/* ---- global init + parallel piece download (connection pool) ----------- */
-
 void patchdl_net_global_init(void)    { curl_global_init(CURL_GLOBAL_ALL); }
 void patchdl_net_global_cleanup(void) { curl_global_cleanup(); }
 
-/* Each write to /data costs about the same whatever its size, and curl hands
-   the body over in ~2 KB pieces: writing each one straight to disk held a
-   download to ~8 MB/s in total. Collecting them into 2 MB blocks first lets
-   the disk keep up with a gigabit line. */
+/* curl hands over ~2 KB chunks and every write to /data costs about the
+   same. writing them one by one topped out at ~8 MB/s, so batch to 2 MB */
 #define PATCHDL_PIECE_WBUF   (2 * 1024 * 1024)
 
-/* Write sink for one piece: pwrite at a fixed base offset (concurrent
-   non-overlapping pieces of the same fd are safe), tee into SHA-256 if asked,
-   and publish bytes-so-far for live progress. A resumed piece starts at
-   `resume` bytes; see piece_header_cb and piece_write_cb for how a server
-   that ignores the range is handled. Bytes are collected in wbuf and
-   written in blocks; `written` counts bytes received, `flushed` the ones
-   already on disk. */
+/* written = received so far, flushed = on disk */
 typedef struct {
     int                 fd;
     long long           base;
@@ -867,7 +798,7 @@ typedef struct {
     long long           flushed;
     unsigned char      *wbuf;         /* NULL: write each chunk directly */
     size_t              wlen;
-    long long           size;         /* the piece's length: never write past it */
+    long long           size;         /* never write past it */
     long long           resume;       /* bytes of the piece already on disk */
     long long           range_start;  /* from Content-Range, -1 if none */
     int                 checked;      /* first body bytes seen */
@@ -878,8 +809,7 @@ typedef struct {
     volatile long long *bytes_slot;
 } piece_sink_t;
 
-/* Feed [offset, offset+size) of fd into md. 0 on success, -1 on a read
-   error, -2 when *abort was set (pause or cancel) on the way. */
+/* -1 read error, -2 aborted (pause or cancel) */
 static int
 digest_fd_region(EVP_MD_CTX *md, int fd, long long offset, long long size,
                  volatile int *abort) {
@@ -904,7 +834,7 @@ piece_header_cb(char *b, size_t size, size_t nitems, void *ud) {
     piece_sink_t *s = (piece_sink_t *)ud;
     size_t        n = size * nitems;
     long long     start;
-    /* A redirect's headers come first; only the last response counts. */
+    /* redirect headers come first, only the last response counts */
     if (n > 5 && !strncmp(b, "HTTP/", 5)) s->range_start = -1;
     if (n > 20 && !strncasecmp(b, "Content-Range:", 14) &&
         sscanf(b + 14, " bytes %lld-", &start) == 1)
@@ -912,7 +842,6 @@ piece_header_cb(char *b, size_t size, size_t nitems, void *ud) {
     return n;
 }
 
-/* Write len bytes at the piece's flushed position. 0 on success. */
 static int
 piece_pwrite(piece_sink_t *s, const unsigned char *p, size_t len) {
     while (len > 0) {
@@ -925,7 +854,6 @@ piece_pwrite(piece_sink_t *s, const unsigned char *p, size_t len) {
     return 0;
 }
 
-/* Put the collected bytes on disk. 0 on success. */
 static int
 piece_flush(piece_sink_t *s) {
     int rc = s->wlen ? piece_pwrite(s, s->wbuf, s->wlen) : 0;
@@ -943,20 +871,20 @@ piece_write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
         s->checked = 1;
         curl_easy_getinfo(s->curl, CURLINFO_RESPONSE_CODE, &code);
         if (code != 206) {
-            /* the server sent the whole piece: start it over in place */
+            /* got the whole piece, start over in place */
             s->written = s->flushed = 0;
             if (s->bytes_slot) *s->bytes_slot = 0;
             if (s->md) EVP_DigestInit_ex(s->md, s->md_type, NULL);
         } else if (s->range_start != s->resume) {
             s->bad_range = 1;
-            return 0;                         /* not where we left off */
+            return 0;                         /* not where it left off */
         }
     }
-    /* more than the piece holds would land in the next piece's bytes */
+    /* overflow would land in the next piece */
     if (s->size > 0 && s->written + (long long)n > s->size) return 0;
     if (s->md) EVP_DigestUpdate(s->md, ptr, n);
     if (!s->wbuf) {
-        if (piece_pwrite(s, ptr, n)) return 0;   /* short write -> curl errors out */
+        if (piece_pwrite(s, ptr, n)) return 0;   /* curl errors out on this */
     } else {
         const unsigned char *p = ptr;
         size_t               left = n;
@@ -977,7 +905,7 @@ piece_xfer_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
               curl_off_t ultotal, curl_off_t ulnow) {
     volatile int *abort_flag = (volatile int *)clientp;
     (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
-    return (abort_flag && *abort_flag) ? 1 : 0;   /* non-zero aborts the transfer */
+    return (abort_flag && *abort_flag) ? 1 : 0;
 }
 
 int
@@ -1019,7 +947,6 @@ patchdl_http_download_piece(const char *url, int fd,
         sink.md = EVP_MD_CTX_new();
         if (!sink.md) { curl_slist_free_all(rl); return -1; }   /* never skip a requested check */
         EVP_DigestInit_ex(sink.md, sink.md_type, NULL);
-        /* the part already on disk goes into the hash first */
         if (sink.md && resume_from) {
             int drc = digest_fd_region(sink.md, fd, file_offset, resume_from,
                                        ctx ? ctx->abort : NULL);
@@ -1065,10 +992,9 @@ patchdl_http_download_piece(const char *url, int fd,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
-    /* HTTPS pin removed on the streaming piece path — see the same change in
-       http_download_to_file_progress for the why. */
+    /* no https pin on redirects, see http_download_to_file_progress */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);   /* 4xx/5xx -> error, no body written */
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
@@ -1080,13 +1006,13 @@ patchdl_http_download_piece(const char *url, int fd,
         curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     (void *)ctx->abort);
     }
 
-    sink.wbuf = malloc(PATCHDL_PIECE_WBUF);   /* NULL: slower, still correct */
+    sink.wbuf = malloc(PATCHDL_PIECE_WBUF);   /* NULL is fine, just slower */
     res = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     note_curl_result(host, res);
     curl_easy_cleanup(curl);
     curl_slist_free_all(rl);
-    /* also after a failure or pause: what arrived is kept for a resume */
+    /* also on failure or pause, keeps what arrived for a resume */
     if (piece_flush(&sink) && res == CURLE_OK) res = CURLE_WRITE_ERROR;
     free(sink.wbuf);
 
@@ -1095,12 +1021,11 @@ patchdl_http_download_piece(const char *url, int fd,
 
     if (res != CURLE_OK) {
         if (sink.md) EVP_MD_CTX_free(sink.md);
-        /* -3: the server can't continue where this piece stopped */
         return sink.resume && (sink.bad_range || http_code == 416) ? -3 : -1;
     }
     if (file_size > 0 && sink.written != file_size) {
         if (sink.md) EVP_MD_CTX_free(sink.md);
-        return -1;                          /* short or over-long -> failed */
+        return -1;                          /* short or too long */
     }
     if (sink.md) {
         unsigned char dig[EVP_MAX_MD_SIZE];
@@ -1111,17 +1036,14 @@ patchdl_http_download_piece(const char *url, int fd,
         if (ok != 1 || dl == 0) return -2;
         hex_encode(dig, dl, hex, sizeof(hex));
         if (strcasecmp(hex, expected_sha256_or_null) != 0)
-            return -2;                      /* integrity mismatch */
+            return -2;
     }
-    /* durable before the caller sets the done bit; an error here means
-       the bytes may not be on disk, so the piece doesn't count */
+    /* must be on disk before the caller sets the done bit */
     if (fdatasync(fd) != 0) return -1;
     return 0;
 }
 
-/* Read-only: hash a [offset, offset+size) region of fd into out_hex (>=65
-   bytes), with the algorithm `like_hex` is written in (see digest_for). Uses
-   pread so it doesn't disturb the fd offset. 0 on success. */
+/* pread, leaves the fd offset alone */
 int
 patchdl_hash_fd_region(int fd, long long offset, long long size,
                        const char *like_hex, char *out_hex) {
@@ -1194,9 +1116,6 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
     for (p = pieces; (p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end); p += 5)
         cap++;
     if (cap <= 0) { free(buf.data); set_last("bad_manifest", 0, g_last.http_code); return -1; }
-    /* Sanity caps: refuse a manifest that would let a CDN drive multi-TB
-       allocations or millions of pieces. The biggest real PS5 patch we've
-       seen is ~70 GB / 18 pieces; these limits leave room to spare. */
     if (cap > PATCHDL_MAX_PIECES) { free(buf.data); set_last("bad_manifest", 0, g_last.http_code); return -1; }
     out->pieces = calloc((size_t)cap, sizeof(patchdl_piece_t));
     if (!out->pieces) { free(buf.data); return -1; }
@@ -1213,10 +1132,9 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
             break;
         json_u64_after(p, "fileSize", &sz, piece_limit);
         if (json_u64_after(p, "fileOffset", &off, piece_limit) != 0)
-            off = (unsigned long long)running;   /* no offset -> assume contiguous */
+            off = (unsigned long long)running;   /* no offset: assume contiguous */
 
-        /* Validate tiling: pieces must be in order, contiguous, non-empty,
-           and each individually under the per-piece cap. */
+        /* in order, no gaps, no empty pieces, under the caps */
         if ((long long)off != running || sz == 0 || sz > PATCHDL_MAX_PIECE_BYTES ||
             (unsigned long long)running + sz > PATCHDL_MAX_TOTAL_BYTES) {
             patchdl_manifest_free(out);
@@ -1236,14 +1154,14 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
         }
         running += (long long)sz;
         n++;
-        out->count = n;          /* keep current so manifest_free frees exactly n */
+        out->count = n;          /* so manifest_free frees exactly n */
         p = obj_end ? obj_end + 1 : p + 5;
     }
     json_string_after(buf.data, "playgoChunkCrcUrl", out->crc_url,
                       sizeof(out->crc_url), NULL);
     free(buf.data);
     if (n == 0) { patchdl_manifest_free(out); set_last("bad_manifest", 0, g_last.http_code); return -1; }
-    out->total = running;        /* authoritative assembled size */
+    out->total = running;
     return 0;
 }
 
@@ -1298,8 +1216,7 @@ patchdl_net_diag(const char *url, char *out_json, size_t sz) {
         }
     }
 
-    /* host, source and trail are plain ASCII from our own resolver; quotes
-       can't occur in them. */
+    /* not escaped. source and trail are ours, host is from Sony's URL */
     snprintf(out_json, sz,
              "{\"host\":\"%s\",\"host_ok\":%d,\"allowed\":%d,"
              "\"dns_rc\":%d,\"ip\":\"%s\",\"dns_source\":\"%s\",\"dns_trail\":\"%s\","
@@ -1315,7 +1232,7 @@ int
 patchdl_http_get(const char *url, patchdl_buf_t *out) {
     (void)url;
     (void)out;
-    return -1; /* curl not available in this build; set CURL_DIR= to enable */
+    return -1; /* built without curl, set CURL_DIR= */
 }
 
 void

@@ -14,11 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Convert packed fw bin to "11.60" string */
 static void
 fw_bin_to_str(uint32_t bin, char *out, size_t sz) {
-    /* Packed firmware: hex digits read as decimal (0x10200006 -> "10.20"),
-       same scheme as patchdl_fw. */
+    /* 0x10200006 is "10.20", same as patchdl_fw */
     snprintf(out, sz, "%x.%02x",
              (bin >> 24) & 0xff,
              (bin >> 16) & 0xff);
@@ -34,8 +32,7 @@ parse_hex(const char *s) {
     return v;
 }
 
-/* Extract attribute value from within a <package ...> tag span.
-   tag_start points to '<', tag_end points past '>'. */
+/* tag_end points past the '>' */
 static int
 attr_val(const char *tag_start, const char *tag_end, const char *attr,
          char *out, size_t out_sz) {
@@ -53,9 +50,7 @@ attr_val(const char *tag_start, const char *tag_end, const char *attr,
         p += strlen(needle);
         for (len = 0; p + len < tag_end && p[len] != '"' && len < out_sz - 1; len++)
             ;
-        /* The value must actually end on its closing quote inside the tag —
-           otherwise we hit tag_end or the buffer limit and would return a
-           silently truncated URL/title as if it were valid. */
+        /* no closing quote means truncated, don't hand out half a URL */
         if (p + len >= tag_end || p[len] != '"')
             return -1;
         memcpy(out, p, len);
@@ -65,14 +60,13 @@ attr_val(const char *tag_start, const char *tag_end, const char *attr,
     return -1;
 }
 
-/* version strings are zero-padded (e.g. "01.041.000") — strcmp orders correctly */
+/* zero padded ("01.041.000"), so strcmp is enough */
 static int
 ver_gt(const char *a, const char *b) {
     return strcmp(a, b) > 0;
 }
 
-/* Extract the first PS4/PS5 title id token ([A-Z]{4}[0-9]{5}, e.g. PPSA03099)
-   from a string such as nptitleid, manifest_url, or delta_url. */
+/* first [A-Z]{4}[0-9]{5} in s, like PPSA03099 */
 static void
 extract_title_id(const char *s, char *out, size_t sz) {
     size_t len;
@@ -80,8 +74,6 @@ extract_title_id(const char *s, char *out, size_t sz) {
     if (sz < 10 || !s) return;
     len = strlen(s);
     if (len < 9) return;
-    /* `len - 9` is the last position where a 9-char id can still fit; this
-       avoids reading p[8] past the NUL terminator. */
     for (size_t i = 0; i <= len - 9; i++) {
         const char *p = s + i;
         int ok = 1;
@@ -133,7 +125,7 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
         char durl[512] = {0};
         char murl[512] = {0};
 
-        /* PS5 version.xml uses content_ver; PS4 uses version. */
+        /* PS5 has content_ver, PS4 just version */
         int is_ps4 = attr_val(p, tag_end, "content_ver", ver, sizeof(ver)) != 0;
         if (is_ps4)
             attr_val(p, tag_end, "version", ver, sizeof(ver));
@@ -142,11 +134,9 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
         attr_val(p, tag_end, "manifest_url", murl, sizeof(murl));
 
         if (ver[0] && (sver[0] || is_ps4)) {
-            /* A PS4 patch's system_ver is a PS4 firmware (in decimal); the
-               PS5 runs PS4 games regardless, so it never blocks one. */
+            /* PS4 system_ver is a PS4 fw, never blocks on the PS5 */
             uint32_t pkg_sver = is_ps4 ? 0 : parse_hex(sver);
 
-            /* Track latest overall */
             if (!out->latest_version[0] || ver_gt(ver, out->latest_version)) {
                 strncpy(out->latest_version, ver, sizeof(out->latest_version) - 1);
                 if (is_ps4)
@@ -156,12 +146,8 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
                                   sizeof(out->latest_required_fw));
             }
 
-            /* Track latest compatible + its installable patch source. PS5
-               updates expose a small delta_url (DP.pkg) plus a manifest_url
-               containing the actual split package pieces. Feeding the DP
-               bootstrap directly can make the system download the full patch
-               under the storage/master title id, so prefer the target-title
-               manifest whenever present. */
+            /* prefer manifest_url. feeding the DP.pkg from delta_url can
+               pull the full patch under the storage title id instead */
             if (pkg_sver <= fw_bin) {
                 if (!out->compatible_version[0] ||
                     ver_gt(ver, out->compatible_version)) {
@@ -198,8 +184,7 @@ patchdl_verxml_query(const char *url, uint32_t fw_bin, patchdl_verinfo_t *out) {
     if (!url || !out) return -1;
     memset(out, 0, sizeof(*out));
 
-    /* version.xml is a few KB in practice; cap so a misbehaving CDN can't
-       slurp unbounded RAM into the buffer. */
+    /* a few KB normally, cap it anyway */
     memset(&buf, 0, sizeof(buf));
     buf.max = 4 * 1024 * 1024;
     if (patchdl_http_get(url, &buf)) return -1;

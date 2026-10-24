@@ -10,10 +10,8 @@ const API = {
   action: (titleId, action) => `/api/titles/${encodeURIComponent(titleId)}/${action}`,
 };
 
-// title_id -> loaded <img>, so re-rendered cards show icons instantly.
 const iconCache = new Map();
 
-// Labels come from i18n.js: source.<type> and source.<type>.desc.
 const SOURCE_TYPES = {
   official:    { className: "ok",       installAllowed: true  },
   external:    { className: "external", installAllowed: true  },
@@ -24,8 +22,6 @@ const SOURCE_TYPES = {
 function sourceLabel(type) { return t(`source.${type}`); }
 function sourceDescription(type) { return t(`source.${type}.desc`); }
 
-// Text for a code from a server/state map: <prefix><code> if translated,
-// else the fallback.
 function tCode(prefix, code, fallbackText) {
   return code && tHas(prefix + code) ? t(prefix + code) : fallbackText;
 }
@@ -121,7 +117,7 @@ let state = {
 let downloadPollTimer = null;
 let installPollTimer = null;
 let emptyPolls = 0;
-const dlMeta = {}; // per-title speed tracking: { bytes, t, speed }
+const dlMeta = {}; // title_id: { bytes, t, speed }
 
 const els = {};
 
@@ -135,7 +131,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(watchTitles, 5000);
   watchCoverErrors();
   document.querySelectorAll("[data-donate]").forEach((b) => b.addEventListener("click", openDonate));
-  // Cards are re-rendered often; listen once on the document.
+  // cards get rebuilt all the time, so delegate
   document.addEventListener("click", (e) => {
     const b = e.target.closest("[data-diag]");
     if (b) openDiag(b.dataset.diag);
@@ -145,7 +141,7 @@ document.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("hashchange", openDiagFromHash);
 });
 
-/* ---------------- dialogs ---------------- */
+/* dialogs */
 
 function icon(name) { return `<svg aria-hidden="true"><use href="#icon-${name}"></use></svg>`; }
 
@@ -153,8 +149,6 @@ function closeButtonHtml() {
   return `<button class="icon-button guide-close" type="button" aria-label="${escapeHtml(t("common.close"))}">${icon("close")}</button>`;
 }
 
-// Modal sheet: Escape, the close button and a click on the backdrop close
-// it, and focus goes back to where it was.
 function openSheet(html, labelledBy, extraClass = "") {
   const back = document.activeElement;
   const wrap = document.createElement("div");
@@ -174,8 +168,6 @@ function openSheet(html, labelledBy, extraClass = "") {
   return { wrap, close };
 }
 
-// The game's icon for a dialog header; initials until it has loaded.
-// A broken icon falls back to the initials (see watchCoverErrors).
 function coverHtml(game, cls) {
   const src = game && game.has_icon ? `/api/icon/${encodeURIComponent(game.title_id)}` : "";
   const ini = escapeHtml(initials(game ? game.name : ""));
@@ -183,7 +175,7 @@ function coverHtml(game, cls) {
     ? `<img src="${src}" alt="">` : ini}</div>`;
 }
 
-// Image errors don't bubble; catch them on the way down instead.
+// img errors don't bubble, so catch them on the way down
 function watchCoverErrors() {
   document.addEventListener("error", (e) => {
     const img = e.target;
@@ -193,12 +185,8 @@ function watchCoverErrors() {
   }, true);
 }
 
-/* ---------------- other versions ---------------- */
+/* other versions */
 
-// Every version Prospero (PS5) or Orbis (PS4) lists for a game, grouped:
-// what can be picked here first, then what needs a newer firmware, the
-// installed one, and older ones folded away. Picking one opens the guide
-// for exactly that version.
 async function openVersions(titleId) {
   const game = state.titles.find((g) => g.title_id === titleId);
   if (!game) return;
@@ -227,7 +215,7 @@ async function openVersions(titleId) {
   const rows = (data.versions || []).slice().sort((a, b) => (a.version < b.version ? 1 : -1));
   const group = (st) => rows.filter((r) => r.state === st);
   const ok = group("ok"), locked = group("needs_fw"), installed = group("installed"), older = group("older");
-  // A locked row names the firmware in its badge already.
+  // locked rows already show the fw in their badge
   const meta = (r) => [r.size, !data.ps4 && r.fw && r.state !== "needs_fw" ? `FW ${r.fw}` : ""]
     .filter(Boolean).map(escapeHtml).join(" · ");
   const row = (r, extra) => `
@@ -265,7 +253,7 @@ async function openVersions(titleId) {
   if (first) first.focus();
 }
 
-/* ---------------- download diagnosis ---------------- */
+/* download diagnosis */
 
 function diagLink(titleId) {
   const h = location.hostname;
@@ -297,9 +285,7 @@ function diagRow(ok, label, detail) {
     <span><strong>${escapeHtml(label)}</strong>${detail ? `<br><em>${escapeHtml(detail)}</em>` : ""}</span></li>`;
 }
 
-// Runs the network check for one game and shows it as a checklist plus a
-// report to paste into an issue. On the PS5 (no clipboard) a QR code opens
-// the same dialog on a phone.
+// no clipboard on the PS5, so a QR opens the same dialog on a phone
 async function openDiag(titleId) {
   const game = state.titles.find((g) => g.title_id === titleId);
   const name = game ? game.name : titleId;
@@ -377,8 +363,7 @@ async function openDiag(titleId) {
 
 const DONATE_URL = "https://paypal.me/oliverkoester";
 
-// Donation dialog. On the TV a link is no use, so it shows a QR code for
-// the phone (hidden on phones, where the button opens PayPal directly).
+// a link is useless on the TV, hence the QR (hidden on phones)
 function openDonate() {
   const matrix = qrEncode(DONATE_URL);
   openSheet(`
@@ -397,11 +382,10 @@ function openDonate() {
       <p class="guide-why"><small>${escapeHtml(t("donate.small"))}</small></p>`, "donateTitle");
 }
 
-// The server rescans on its own when games are added or removed and bumps
-// titles_gen whenever the list or an update check changes; reload quietly then.
+// server bumps titles_gen when the game list or an update check changes
 let watchBusy = false;
 async function watchTitles() {
-  if (watchBusy) return;   // a slow reload is still running
+  if (watchBusy) return;
   watchBusy = true;
   try {
     const response = await fetch(API.status, { cache: "no-store" });
@@ -410,13 +394,12 @@ async function watchTitles() {
     const changed = state.status && status.titles_gen !== state.status.titles_gen;
     if (changed) await loadInitialData({ quiet: true });
     else { state.status = status; renderStatus(); }
-  } catch (_) { /* offline for a moment; the next tick retries */ }
+  } catch (_) { /* offline for a sec, next tick retries */ }
   finally { watchBusy = false; }
 }
 
-// Refresh button: ask for a rescan right away, then reload once it had time.
 async function rescanNow() {
-  try { await postJson(API.rescan, {}); } catch (_) { /* older server: plain reload */ }
+  try { await postJson(API.rescan, {}); } catch (_) { /* older server, plain reload then */ }
   await new Promise((resolve) => setTimeout(resolve, 1500));
   await loadInitialData();
 }
@@ -497,7 +480,6 @@ function bindEvents() {
     els.connPlus.addEventListener("click", () => setConnections(clampConn(state.config.max_connections) + 1));
 }
 
-// Language selector in Settings: applies at once (reloads the page), no Save.
 function fillLanguageSelect() {
   const sel = document.getElementById("language");
   if (!sel) return;
@@ -534,17 +516,13 @@ async function loadInitialData({ quiet = false } = {}) {
     getJson(API.downloads, fallback.downloads),
   ]);
 
-  // /api/titles carries no client-only progress flags, so preserve them across a
-  // refresh — otherwise an in-flight download/install flips back to a clickable
-  // button mid-operation.
-  // Carry client-only flags across a refresh; the pool's job list is the source
-  // of truth for download state and is reconciled right after.
+  // /api/titles has no client-only flags. carry them over or a running job
+  // flips back to a clickable button. the job list fixes the rest below
   const prev = new Map(state.titles.map((g) => [g.title_id, g]));
   titles.forEach((g) => {
     const old = prev.get(g.title_id);
-    // Neither state has a patch left to fetch, so drop stale job flags.
-    // An install ends when the install poll says so, not when the list
-    // already reports the new version (the console writes it mid-install).
+    // the console writes the new version mid-install, so only the install
+    // poll ends an install
     if (old && old.installing) {
       g.installing = true;
       g.installStatus = old.installStatus;
@@ -552,6 +530,7 @@ async function loadInitialData({ quiet = false } = {}) {
       g.installDone = old.installDone;
       g.installTotal = old.installTotal;
     }
+    // up_to_date / incompatible_fw: nothing left to fetch, drop stale flags
     if (old && g.status !== "up_to_date" &&
         (g.status !== "incompatible_fw" || g.manual_version)) {
       if (old._autoInstalled) g._autoInstalled = true;
@@ -560,8 +539,7 @@ async function loadInitialData({ quiet = false } = {}) {
     }
   });
 
-  // A background reload must not swap the real list for demo data because
-  // one request failed for a moment.
+  // one failed request on a quiet reload shouldn't swap in the demo data
   if (quiet && state.usingFallback) { state.usingFallback = false; return; }
   state = { ...state, status, config, titles, downloads };
   reconcileFromJobs(downloads);
@@ -571,7 +549,6 @@ async function loadInitialData({ quiet = false } = {}) {
       state.titles.some((g) => g._localDownloading))
     startDownloadPolling();
   if (state.titles.some((g) => g.installing)) startInstallPolling();
-  // Pick up installs that are running while this page was (re)loaded.
   if (!quiet) refreshInstallStatus();
   if (!quiet)
     showToast(state.usingFallback ? t("toast.demoData") : t("toast.refreshed"));
@@ -604,7 +581,6 @@ function renderStatus() {
   els.spaceValue.textContent = space;
   const kept = Number(state.status.downloads_bytes) || 0;
   if (kept > 0) {
-    // Packages on disk take space too; the link opens the list to manage them.
     els.downloadDirValue.innerHTML =
       `<button type="button" class="link-button">${escapeHtml(t("metric.downloadsManage", { size: formatBytes(kept) }))}</button>`;
     els.downloadDirValue.querySelector("button").addEventListener("click", () => setView("settings"));
@@ -632,9 +608,8 @@ function renderConnStepper() {
 }
 
 let connSaveTimer = null;
-// Stepper +/-: update + re-render immediately, then persist just this field
-// (debounced) so rapid taps collapse into one POST and other unsaved form
-// fields stay untouched. The server applies the new count live (no restart).
+// debounced, posts only this field so other unsaved settings stay put.
+// the server picks it up live
 function setConnections(n) {
   const v = clampConn(n);
   if (v === clampConn(state.config.max_connections)) { renderConnStepper(); return; }
@@ -668,7 +643,7 @@ function renderSettings() {
   renderSourcePolicies();
 }
 
-/* ---------------- games ---------------- */
+/* games */
 
 function renderGames() {
   renderGlobalStatus();
@@ -692,14 +667,10 @@ function renderGames() {
   visible.forEach((game) => els.gameGrid.appendChild(createGameCard(game)));
 }
 
-// One bucket per game for the filter chips, answering a single question: is
-// there something to get for this console? Where the patch comes from (Sony,
-// Prospero) and whether it installs or only downloads is shown on the card.
 function isPs4(game) { return (game.title_id || "").startsWith("CUSA"); }
 
 function gameCategory(game) {
   const policy = sourcePolicy(game);
-  // Not supported = PatchDL can't install it (fake packages, mounted images).
   if (game.patch_title_match === false || !policy.allow_install || game.status === "blocked")
     return "blocked";
   if (game.downloading || game.resumable || game.downloaded || game.installing || game._jobState)
@@ -709,8 +680,8 @@ function gameCategory(game) {
   return "uptodate";
 }
 
-// Sony's newest patch needs newer firmware, but Prospero knows an older one
-// that runs here and is newer than what is installed.
+// sony's newest needs newer fw, but prospero has an older one that runs here
+// and still beats the installed one
 function hasOlderPatch(game) {
   return game.status === "incompatible_fw" && Boolean(game.prospero_version) &&
     game.prospero_version > (game.installed_version || "");
@@ -735,7 +706,6 @@ function createGameCard(game) {
   if (game.downloading) card.classList.add("is-downloading");
   if (game.installing) card.classList.add("is-installing");
 
-  // ---- top row: icon (+ toggle) | body | action ----
   const row = document.createElement("div");
   row.className = "card-row";
 
@@ -745,8 +715,7 @@ function createGameCard(game) {
   cover.className = "cover";
   cover.textContent = initials(game.name);
   if (game.has_icon) {
-    // Cards re-render on every poll. Reuse an icon that already loaded so
-    // it doesn't flash back to the initials; a failed icon keeps them.
+    // cards re-render on every poll, reuse the loaded icon or it flashes
     const loaded = iconCache.get(game.title_id);
     if (loaded) {
       cover.replaceChildren(loaded.cloneNode());
@@ -803,7 +772,6 @@ function createGameCard(game) {
   row.append(lead, body, actions);
   card.appendChild(row);
 
-  // ---- progress block (only while downloading) ----
   if (game.downloading) {
     const d = state.downloads.find((x) => x.title_id === game.title_id) || {};
     const prog = document.createElement("div");
@@ -824,7 +792,7 @@ function createGameCard(game) {
     `;
     card.appendChild(note);
   } else if (game.resumable && game.partial_bytes > 0) {
-    // ---- paused partial (survived a reboot) ----
+    // paused partial, survives a reboot
     const note = document.createElement("div");
     note.className = "card-progress";
     note.innerHTML = `
@@ -859,8 +827,6 @@ function buildToggle(game) {
   return toggle;
 }
 
-// Primary play/pause button (green to go, amber while downloading). Fixed width
-// (CSS) so the label never reflows. Returns null when there is nothing to do.
 function primaryButton(game) {
   if (game.installing) return { label: t("btn.installing"), variant: "ghost", disabled: true };
   if (game.downloading) return { label: t("btn.pause"), action: "pause", variant: "pause", hint: t("btn.pauseHint") };
@@ -880,8 +846,7 @@ function primaryButton(game) {
     : { label: t("btn.download"), action: "download", variant: "update", hint: t("btn.downloadHint") };
 }
 
-// Red stop button: present whenever there is a download to stop or discard.
-// Cancel stops AND deletes (unlike Pause, which keeps the partial).
+// cancel deletes the partial, pause keeps it
 function stopButton(game) {
   if (game.installing) return null;
   if (game.downloaded && !game.downloading)
@@ -891,8 +856,6 @@ function stopButton(game) {
   return null;
 }
 
-// Installed -> what PatchDL can get for this console -> newest overall with
-// the firmware it needs (left out when it's the same as the offered update).
 function versionTrackHtml(game) {
   const step = (label, version, note, cls = "") => `
     <div class="vstep ${cls}"><span>${label}</span><b>${escapeHtml(version)}</b>${note ? `<em>${note}</em>` : ""}</div>`;
@@ -913,11 +876,9 @@ function versionTrackHtml(game) {
     parts.push(step(t("card.lblNewest"), game.latest_version,
       game.latest_required_fw ? t("card.needsFw", { fw: escapeHtml(game.latest_required_fw) }) : "", "is-dim"));
   const arrow = `<span class="vtrack-arrow">${icon("arrow")}</span>`;
-  // The arrow only leads to something PatchDL can get.
   return `<div class="vtrack">${offered ? parts[0] + arrow + parts.slice(1).join("") : parts.join("")}</div>`;
 }
 
-// Problems and hints under the versions, each with what to do about it.
 function cardNotesHtml(game) {
   const notes = [];
   const job = state.downloads.find((d) => d.title_id === game.title_id);
@@ -948,8 +909,6 @@ function statusPill(game) {
   return `<span class="pill">${t("pill.noInfo")}</span>`;
 }
 
-// Official installs are the normal case and need no badge; every other
-// source gets one.
 function sourcePill(game) {
   const info = sourceInfo(game);
   const type = SOURCE_TYPES[sourceType(game)] ? sourceType(game) : "unknown";
@@ -959,7 +918,7 @@ function sourcePill(game) {
 function sourceInfo(game) { return SOURCE_TYPES[sourceType(game)] || SOURCE_TYPES.unknown; }
 function sourceType(game) { return game.source_type || "unknown"; }
 
-/* ---------------- download progress (in-tile) ---------------- */
+/* download progress */
 
 function pctOf(d) {
   const done = Number(d.bytes) || 0;
@@ -984,12 +943,10 @@ function progressMetaHtml(d) {
   return parts.join("");
 }
 
-// One sweep of the indeterminate bar. Cards are rebuilt on every list
-// update; a negative delay taken from the clock lets a rebuilt bar continue
-// where the old one was instead of starting over.
+// one sweep of the indeterminate bar. the negative delay from the clock
+// keeps a rebuilt card's bar from starting over
 const INDET_MS = 1600;
 
-// Install phases with their own text (install.phase.<status> in i18n.js).
 const INSTALL_PHASES = ["waiting", "reading", "finishing"];
 
 function installProgressHtml(game) {
@@ -1024,16 +981,13 @@ function stopDownloadPolling() {
   downloadPollTimer = null;
 }
 
-// Map the pool's job list onto per-title flags, and auto-install once a job
-// finishes if "install after download" is on.
 function reconcileFromJobs(jobs) {
   const byId = new Map((jobs || []).map((j) => [j.title_id, j]));
   state.titles.forEach((g) => {
     const j = byId.get(g.title_id);
     if (!j) {
-      // The pool never produced a job for our local intent: time it out so the
-      // card can't wedge in "Downloading" forever (server restart between POST
-      // and poll, or an unexpected response shape).
+      // pool never picked up the local start (server restart, odd response),
+      // time it out so the card doesn't hang on Downloading
       if (g._localDownloading && g._localSince &&
           Date.now() - g._localSince > 12000) {
         g._localDownloading = false;
@@ -1042,10 +996,9 @@ function reconcileFromJobs(jobs) {
       g._jobState = null;
       return;
     }
-    // A download started from this page counts as watched even if it
-    // finished before a poll saw it running (a verified package on disk).
+    // started here counts as watched, even if no poll saw it running
     if (g._localDownloading) g._wasActive = true;
-    g._localDownloading = false; // the pool now tracks it
+    g._localDownloading = false;
     g._jobState = j.state;
     if (j.state === "active" || j.state === "queued") {
       g._spaceWarned = false;
@@ -1058,10 +1011,8 @@ function reconcileFromJobs(jobs) {
       g.partial_bytes = Number(j.bytes) || g.partial_bytes || 0;
       g._wasActive = false;
     } else if (j.state === "done") {
-      // Auto-install once, on the download finishing while this page watched
-      // it, and only while the update is still pending. A finished job stays
-      // in the pool; without these checks every poll would retry the install
-      // (refused as already installed) and redraw the list each time.
+      // auto-install once, only if this page saw it finish and the update is
+      // still pending. done jobs stay in the pool, or every poll would retry
       const justFinished = g._wasActive;
       const pending = g.status === "available" || Boolean(g.manual_version);
       g.downloading = false;
@@ -1074,9 +1025,7 @@ function reconcileFromJobs(jobs) {
         doInstall(g);
       }
     } else if (j.state === "error") {
-      // The server keeps the partial + sidecar (resumable) on a post-retry
-      // network failure. Reflect that so primaryButton shows "Resume" and the
-      // red Cancel stays available to delete the kept partial.
+      // server keeps partial + sidecar after giving up, so offer Resume/Cancel
       const bytes = Number(j.bytes) || 0;
       if (Number(j.rc) === -3) {
         if (!g._spaceWarned) showToast(t("toast.nameMessage", { name: g.name, message: noSpaceText(j.need_bytes, j.free_bytes, j.space_install) }));
@@ -1097,10 +1046,9 @@ function reconcileFromJobs(jobs) {
   });
 }
 
-// Why the package list (manifest) couldn't be fetched, in words.
 function failStepText(j) {
   const http = Number(j.last_http_code) || 0;
-  // "connect": DNS answered, but no address took the connection.
+  // connect: DNS worked, but nobody took the connection
   const step = j.fail_step === "connect" ? "network" : j.fail_step;
   const key = `failstep.${step}`;
   return step && step !== "unknown" && tHas(key)
@@ -1135,9 +1083,8 @@ async function refreshInstallStatus() {
     return;
   }
 
-  // Installs streamed from PatchDL: what PatchDL measured itself (how much
-  // of each package the console read) beats Sony's status query, which fails
-  // or reports nothing useful for them. One entry per title.
+  // streamed installs: own byte count beats Sony's status query, which has
+  // nothing useful for these
   const streams = Array.isArray(s.streams) ? s.streams : [];
   if (streams.length) {
     let ended = false, changed = false;
@@ -1149,8 +1096,6 @@ async function refreshInstallStatus() {
       const total = Number(st.total) || 0;
       const read = Math.min(Number(st.read) || 0, total || Infinity);
       const pct = total ? Math.floor((read * 100) / total) : 0;
-      // Re-render only on a visible change: a rebuilt card restarts the
-      // indeterminate bar's animation.
       if (game.installing !== !over || game.installStatus !== st.phase ||
           game.installProgress !== pct) changed = true;
       game.installing = !over;
@@ -1210,7 +1155,7 @@ async function refreshDownloads() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     jobs = await response.json();
   } catch (error) {
-    return; // keep last state on a transient failure
+    return; // blip, keep the last state
   }
 
   const now = Date.now();
@@ -1224,7 +1169,7 @@ async function refreshDownloads() {
         const inst = ((done - prev.bytes) * 1000) / (now - prev.t); // bytes/s
         prev.speed = prev.speed ? prev.speed * 0.5 + inst * 0.5 : inst; // smoothed
       } else {
-        prev.speed = 0; // counter went backwards -> re-baseline
+        prev.speed = 0; // counter went backwards, start over
       }
     }
     const meta = prev || (dlMeta[j.title_id] = { speed: 0 });
@@ -1250,9 +1195,8 @@ function downloadingIds() {
   return state.titles.filter((g) => g.downloading).map((g) => g.title_id).join(",");
 }
 
-// Top-of-page status banner. Visible while any job in this batch is queued,
-// active, or has just finished (done jobs linger one or two polls before the
-// pool reaps them, which is what gives us the "5 of 9" position).
+// only while something is queued or active. done jobs linger a poll or two
+// before the pool reaps them, that's where "5 of 9" comes from
 function renderGlobalStatus() {
   const el = els.globalDl;
   if (!el) return;
@@ -1269,12 +1213,10 @@ function renderGlobalStatus() {
   const pos    = Math.min(total, done + 1);
   const isActive = active && active.state === "active";
 
-  // Eyebrow + name
   els.globalDlState.textContent = !isActive ? t("dl.queued") : active.verifying ? t("dl.verifying") : t("dl.downloading");
   const activeGame = state.titles.find((g) => g.title_id === active.title_id);
   els.globalDlName.textContent  = active.name || (activeGame && activeGame.name) || active.title_id || "—";
 
-  // Position chip ("3 of 9") only when there's more than one game in this run
   if (total > 1) {
     els.globalDlPosition.hidden = false;
     els.globalDlPosition.textContent = t("dl.position", { pos, total });
@@ -1282,7 +1224,6 @@ function renderGlobalStatus() {
     els.globalDlPosition.hidden = true;
   }
 
-  // Progress line
   const pct   = pctOf(active);
   const speed = Number(active._speed) || 0;
   const done_ = Number(active.bytes) || 0;
@@ -1295,7 +1236,7 @@ function renderGlobalStatus() {
     ? t("progress.eta", { eta: formatEta((total_ - done_) / speed) })
     : "";
 
-  // Bar: animated indeterminate while fetching manifest, otherwise width=pct
+  // no total yet: still fetching the manifest
   if (isActive && total_ > 0) {
     els.globalDlBar.classList.remove("is-indeterminate");
     els.globalDlBar.style.width = pct + "%";
@@ -1304,14 +1245,11 @@ function renderGlobalStatus() {
   }
 }
 
-// Update the progress bar/meta in place to avoid rebuilding every card each tick.
 function applyDownloadProgress() {
   renderGlobalStatus();
   let needRender = false;
   state.downloads.forEach((d) => {
-    // Only titles currently downloading render a progress tile; paused/done/error
-    // jobs linger in the pool list but have no .progress bar — skip them so a
-    // missing tile for a non-downloading title doesn't force a full rebuild.
+    // paused/done/error jobs have no bar, don't let them force a rebuild
     const g = state.titles.find((t) => t.title_id === d.title_id);
     if (!g || !g.downloading) return;
     const card = els.gameGrid.querySelector(`[data-title-id="${d.title_id}"]`);
@@ -1324,9 +1262,8 @@ function applyDownloadProgress() {
   if (needRender) renderGames();
 }
 
-/* ---------------- settings ---------------- */
+/* settings */
 
-// Labels: storage.state.<state> in i18n.js.
 const STORAGE_STATE = {
   complete: { className: "ok" },
   paused: { className: "warn" },
@@ -1335,9 +1272,7 @@ const STORAGE_STATE = {
   failed: { className: "blocked" },
 };
 
-// What PatchDL keeps under /data/patchdl, one row per title folder, with a
-// delete button that also works for games that are no longer installed.
-/* ---------------- download drive ---------------- */
+/* download drive */
 
 let drives = null;   // from /api/drives: [{path, free_mb, total_mb}]
 
@@ -1368,6 +1303,7 @@ async function loadDrives() {
   renderDrives();
 }
 
+// delete works even when the game is gone
 async function loadStorage() {
   if (!els.storageList) return;
   let data;
@@ -1409,8 +1345,6 @@ async function loadStorage() {
   }));
 }
 
-// How the package relates to the installed game, so a kept package can be
-// judged: still useful (newer), spent (installed), or for a game not present.
 function storageRelation(item) {
   if (!item.installed) return t("storage.rel.notInstalled");
   if (!item.version || !item.installed_version) return t("storage.rel.versionUnknown");
@@ -1446,9 +1380,7 @@ function renderSourcePolicies() {
   els.sourcePolicyList.replaceChildren(...rows);
 }
 
-// Log entries keep their key and values, so the Logs view shows them in the
-// chosen language while the diagnostic report (pasted into issues) stays
-// English.
+// key + vars: the Logs view gets translated, the report stays English
 function addLog(key, vars) {
   state.logs.push({ time: timeNow(), key, vars });
 }
@@ -1485,16 +1417,10 @@ async function saveConfig() {
   renderGames(); // install_after_download changes the button label
 }
 
-/* ---------------- actions (data layer) ---------------- */
+/* actions */
 
-// Queue a download for every game that has an available update AND could
-// actually be installed afterwards. Shadowmounts pass isDownloadAllowed but
-// fail isInstallAllowed (their app slot has no real source medium), so a
-// sweep would otherwise pull tens of GB that AppInstUtil will refuse — the
-// user picks those up by hand when the disc is ready. The server tolerates
-// duplicate requests, so a second click is harmless. If install_after_download
-// is on, the per-job auto-install pipeline kicks in once each download
-// finishes — no further client action needed.
+// installable only: shadowmounts would pull tens of GB that AppInstUtil
+// refuses anyway (no real source medium). double clicks are fine server side
 async function updateAll() {
   const targets = state.titles.filter((g) =>
     g.status === "available" && isInstallAllowed(g) &&
@@ -1505,18 +1431,16 @@ async function updateAll() {
   }
   showToast(t(targets.length === 1 ? "toast.queueingOne" : "toast.queueingMany", { count: targets.length }));
   for (const g of targets) {
-    // Sequential await: the pool returns quickly (202 Accepted) and we want
-    // a stable order in the queue, not a thundering-herd of concurrent POSTs.
-    try { await doDownload(g); } catch (_) { /* per-job errors already toast */ }
+    // one at a time keeps the queue order
+    try { await doDownload(g); } catch (_) { /* doDownload toasts its own errors */ }
   }
 }
 
-// Enqueue a download. The pool returns immediately (202); progress, completion
-// and (if configured) auto-install are driven by reconcileFromJobs() on poll.
+// pool answers 202 right away, reconcileFromJobs does the rest on poll
 async function doDownload(game) {
   game.downloading = true;
-  game._localDownloading = true;   // until the pool reports a job for this title
-  game._localSince = Date.now();   // bounded in reconcileFromJobs if no job appears
+  game._localDownloading = true;   // until the pool has a job for it
+  game._localSince = Date.now();   // times out in reconcileFromJobs
   game._autoInstalled = false;
   state.downloads = state.downloads.filter((i) => i.title_id !== game.title_id);
   state.downloads.push({ title_id: game.title_id, name: game.name,
@@ -1552,16 +1476,16 @@ async function doInstall(game, force = false) {
   game.installing = true;
   game.installStatus = "starting";
   game.installProgress = 0;
-  game.downloaded = false; // the package is being consumed by the install
+  game.downloaded = false;
   renderGames();
   try {
     await postJson(API.action(game.title_id, "install") + (force ? "?force=1" : ""), {});
   } catch (error) {
-    game.downloaded = wasDownloaded;   // refused: the package is untouched
+    game.downloaded = wasDownloaded;   // refused, package untouched
     const b = (error && error.body) || {};
     if (b.reason === "install_space" && !force) {
-      // Little room on the game's drive: the console would likely stop
-      // right after reading the header. Let the user decide.
+      // tight on the game's drive, the console would likely stop right after
+      // the header. let the user decide
       game.installing = false;
       renderGames();
       if (window.confirm(t("install.lowSpace", {
@@ -1572,7 +1496,7 @@ async function doInstall(game, force = false) {
       return false;
     }
     if (error.body && error.body.reason === "install_running") {
-      // Another tab or device started it: follow that install here.
+      // another tab or device started it, just follow along
       startInstallPolling();
     } else {
       game.installing = false;
@@ -1590,8 +1514,7 @@ async function doInstall(game, force = false) {
   return true;
 }
 
-// Cancel a running download (server aborts + deletes the partial) or delete a
-// finished package. Same endpoint handles both.
+// aborts and deletes a running download, or deletes a finished pkg
 async function cancelDownload(titleId) {
   const game = state.titles.find((g) => g.title_id === titleId);
   try {
@@ -1599,7 +1522,7 @@ async function cancelDownload(titleId) {
     showToast(t("toast.cancelled", { name: game ? game.name : titleId }));
   } catch (error) {
     showToast(t("toast.nameMessage", { name: game ? game.name : titleId, message: reasonText(error) }));
-    return;   // refused (e.g. the console is installing from it): nothing changed
+    return;   // refused, the console may be installing from it
   }
   if (game) {
     game.downloading = false;
@@ -1618,8 +1541,7 @@ async function cancelDownload(titleId) {
 async function runTitleAction(titleId, action) {
   const game = state.titles.find((i) => i.title_id === titleId);
   if (!game) return;
-  // "update" and "download" both just enqueue; for "update" (install-after-
-  // download on) the reconciler auto-installs once the pool reports it done.
+  // update = download, the reconciler installs once it's done
   if (action === "download" || action === "update") await doDownload(game);
   else if (action === "install") await doInstall(game);
   else if (action === "pause") await doPause(game);
@@ -1627,8 +1549,7 @@ async function runTitleAction(titleId, action) {
   else if (action === "guide") openGuide(game);
 }
 
-// Pause only sends the signal; the in-flight doDownload() request returns its
-// "paused" result and updates the card (resumable + partial bytes).
+// only sends the signal, the next poll flips the card to paused
 async function doPause(game) {
   try {
     await postJson(API.action(game.title_id, "pause"), {});
@@ -1650,7 +1571,7 @@ function updateGame(titleId, patch) {
     .catch(() => showToast(t("toast.toggleFailed", { id: titleId })));
 }
 
-/* ---------------- policy helpers ---------------- */
+/* policy */
 
 function isInstallBlocked(game) { return !sourcePolicy(game).allow_install; }
 function isDownloadAllowed(game) {
@@ -1692,9 +1613,8 @@ async function postJson(url, body) {
   return data;
 }
 
-// Server refusal reasons are translated as reason.<code> in i18n.js.
-// The server keeps 2 GB free on /data on top of the package itself.
-// install: the download fit, but installing it afterwards wouldn't.
+// server keeps 2 GB free on top of the package. install: the download fit,
+// the install afterwards wouldn't
 function noSpaceText(need, free, install) {
   return t(install ? "reason.noSpaceInstall" : "reason.noSpace",
     { need: formatBytes(need), free: formatBytes(free) });
@@ -1706,9 +1626,8 @@ function reasonText(error) {
     (error && error.message) || t("reason.fallback");
 }
 
-/* ---------------- QR code (byte mode, ECC level M, versions 1-6) ----------------
-   Enough for ~100 bytes, i.e. any PatchDL link. Follows ISO/IEC 18004; the
-   structure mirrors Project Nayuki's reference encoder. */
+/* QR code: byte mode, ECC M, versions 1-6, ~100 bytes is plenty for a link.
+   ISO/IEC 18004, structured after Project Nayuki's encoder. no npm here */
 
 const QR_ECC_M = [0, 10, 16, 26, 18, 24, 16];      // ECC codewords per block
 const QR_BLOCKS_M = [0, 1, 1, 1, 2, 2, 4];         // number of blocks
@@ -1759,14 +1678,14 @@ function qrRsRemainder(data, divisor) {
   return r;
 }
 
-// Returns a square boolean matrix (true = dark), or null if text is too long.
+// square bool matrix, true = dark. null if the text doesn't fit
 function qrEncode(text) {
   const bytes = Array.from(new TextEncoder().encode(text));
   let ver = 1;
   while (ver <= 6 && 4 + 8 + bytes.length * 8 > qrDataCodewords(ver) * 8) ver++;
   if (ver > 6) return null;
 
-  // Data bit stream: byte mode, 8-bit length, payload, terminator, padding.
+  // byte mode, 8-bit length, payload, terminator, padding
   const bits = [];
   const push = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
   push(0x4, 4);
@@ -1779,7 +1698,7 @@ function qrEncode(text) {
   const data = [];
   for (let i = 0; i < bits.length; i += 8) data.push(parseInt(bits.slice(i, i + 8).join(""), 2));
 
-  // Split into blocks, add Reed-Solomon ECC, interleave.
+  // blocks, Reed-Solomon ECC, interleave
   const numBlocks = QR_BLOCKS_M[ver];
   const eccLen = QR_ECC_M[ver];
   const rawCodewords = Math.floor(qrRawModules(ver) / 8);
@@ -1800,7 +1719,6 @@ function qrEncode(text) {
       if (i !== shortLen - eccLen || j >= numShort) codewords.push(blk[i]);
     });
 
-  // Function patterns.
   const size = ver * 4 + 17;
   const mod = Array.from({ length: size }, () => new Array(size).fill(false));
   const fn = Array.from({ length: size }, () => new Array(size).fill(false));
@@ -1839,7 +1757,7 @@ function qrEncode(text) {
   };
   drawFormat(0);   // reserve the format areas before placing data
 
-  // Data placement: two-column zigzag from the bottom right.
+  // data: zigzag in column pairs from the bottom right
   let i = 0;
   for (let right = size - 1; right >= 1; right -= 2) {
     if (right === 6) right = 5;
@@ -1870,7 +1788,7 @@ function qrEncode(text) {
       for (let x = 0; x < size; x++)
         if (!fn[y][x] && maskFn[m](x, y)) mod[y][x] = !mod[y][x];
   };
-  // Simplified penalty (runs, 2x2 blocks, balance) to pick a readable mask.
+  // simplified penalty (runs, 2x2, balance), good enough to pick a mask
   const penalty = () => {
     let p = 0, dark = 0;
     for (let a = 0; a < size; a++) {
@@ -1906,7 +1824,7 @@ function qrEncode(text) {
   return mod;
 }
 
-// SVG markup for a QR matrix, dark on white with the required 4-module margin.
+// dark on white with the 4-module quiet zone scanners want
 function qrSvg(matrix) {
   const n = matrix.length, q = 4, s = n + q * 2;
   let d = "";
@@ -1916,18 +1834,14 @@ function qrSvg(matrix) {
   return `<svg xmlns="http://www.w3.org/2000/svg" class="qr" viewBox="0 0 ${s} ${s}" shape-rendering="crispEdges" role="img" aria-label="${escapeHtml(t("qr.aria"))}"><rect width="${s}" height="${s}" fill="#fff" stroke="none"/><path d="${d}" fill="#000" stroke="none"/></svg>`;
 }
 
-/* ---------------- older patch guide (Prospero) ---------------- */
+/* older patch guide */
 
-// Sony's version.xml only lists the newest patch. When that needs newer
-// firmware, Prospero Patches still has older ones, but its links sit behind a
-// human check, so the user copies one link and PatchDL does the rest. Copying
-// is awkward in the PS5 browser, hence the QR hand-off to a phone.
+// version.xml only lists the newest patch. prospero has older ones, behind a
+// human check, so a human copies one link and PatchDL does the rest
 
 const guide = { el: null, game: null, pick: null, fromLink: false, started: false, busy: false,
                 lastUrl: "", timer: null, returnFocus: null, onKey: null };
 
-// The version the guide fetches: the older-firmware patch Prospero found, or
-// one the user picked under "Other versions" (Prospero for PS5, Orbis for PS4).
 function pickFor(game, version, size) {
   const ps4 = isPs4(game);
   const site = ps4 ? "Orbis Patches" : "Prospero Patches";
@@ -1938,7 +1852,6 @@ function pickFor(game, version, size) {
            fw: game.prospero_required_fw || "", site, page, ps4, chosen: false };
 }
 
-// No download or install in the way, and downloads allowed for this game.
 function canPickVersion(game, version) {
   return !game.downloading && !game.downloaded && !game.resumable && !game.installing &&
     isDownloadAllowed({ ...game, manual_version: version });
@@ -1951,8 +1864,7 @@ function canGetOlderPatch(game) {
     isDownloadAllowed({ ...game, manual_version: game.prospero_version });
 }
 
-// A link a phone can open. A page opened on the PS5 itself runs on 127.0.0.1,
-// so the server reports its LAN address for this.
+// on the PS5 the page runs on 127.0.0.1, phones need the LAN address
 function phoneLink(game, pick) {
   const h = location.hostname;
   let base = location.origin;
@@ -1998,8 +1910,7 @@ function clearGuideHash() {
     history.replaceState(null, "", location.pathname + location.search);
 }
 
-// The PS5 browser can't copy links, so on the console the guide only hands
-// over to a phone. Opened via the home-screen tile the page runs on 127.0.0.1.
+// the home tile opens the page on 127.0.0.1
 function isConsoleBrowser() {
   const h = location.hostname;
   return /PlayStation/i.test(navigator.userAgent) || h === "127.0.0.1" || h === "localhost";
@@ -2120,8 +2031,7 @@ function closeGuide() {
   if (guide.returnFocus && document.contains(guide.returnFocus)) guide.returnFocus.focus();
 }
 
-// The last link in the field wins, so pasting a new link next to a rejected
-// one (instead of over it) still picks up the new one.
+// last link wins, so pasting next to a rejected one still works
 function extractLink(text) {
   const all = String(text || "").match(/https?:\/\/(?:(?!https?:\/\/)[^\s"'<>])+/g) || [];
   const pkgs = all.filter((u) => /\.(pkg|crc|json)$/i.test(u));
@@ -2193,8 +2103,6 @@ async function guideSubmit(url, force) {
   guideStatus("ok", t("guide.started"));
 }
 
-// Card state for a download that the server has accepted (from this page or
-// from a phone); the pool's job list takes over from here.
 function manualDownloadStarted(game, version) {
   game.manual_version = version;
   game.downloading = true;
@@ -2224,8 +2132,7 @@ async function guidePoll() {
   const j = (jobs || []).find((x) => x.title_id === game.title_id);
   if (!j) return;
   if (!guide.started) {
-    // Only a job that is actually running means a link arrived from elsewhere;
-    // an old failed or paused entry does not.
+    // only a running job means a link came in from elsewhere, not an old one
     if (j.state !== "queued" && j.state !== "active") return;
     manualDownloadStarted(game, guide.pick.version);
     if (!guide.fromLink) {
@@ -2250,13 +2157,12 @@ async function guidePoll() {
     `<span>${total ? `${formatBytes(j.bytes)} / ${formatBytes(total)} · ` : ""}${pct}%</span></span>`);
 }
 
-/* ---------------- formatting ---------------- */
+/* formatting */
 
 function initials(name) {
   return (name || "PD").split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0]).join("").toUpperCase();
 }
 
-// Auto-scaled byte sizes: B / KB / MB / GB / TB.
 function formatBytes(bytes) {
   const n = Number(bytes);
   if (!Number.isFinite(n) || n < 0) return "--";
@@ -2267,7 +2173,6 @@ function formatBytes(bytes) {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// Free space comes from the backend in MB.
 function formatMb(mb) {
   const n = Number(mb);
   if (!Number.isFinite(n)) return "--";

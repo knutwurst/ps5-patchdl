@@ -16,17 +16,14 @@ typedef struct {
     char title_name[128];
     char content_id[64];
     char content_version[16];
-    char version_file_uri[256]; /* Sony version.xml URL (UUID assigned) */
+    char version_file_uri[256]; /* version.xml URL */
     char icon_path[256];        /* icon0Info without its "?ts=" suffix, or "" */
 } patchdl_appinfo_t;
 
-/* Read the PS5 app database (tbl_contentinfo) for installed-title metadata.
-   Returns 0 on success with a malloc'd array (caller frees with
-   patchdl_appdb_free). Requires elevated authid plus either the root-vnode
-   swap or, with `relative` set, the working directory at the system root
-   (the caller arranges this). */
+/* tbl_contentinfo from app.db. needs elevated authid plus the root vnode
+   swap, or with relative set, the cwd at the system root */
 int  patchdl_appdb_load(patchdl_appinfo_t **out, size_t *count, int relative);
-/* Why the last relative load failed to copy app.db (errno text), or "". */
+/* why the last app.db copy failed, or "" */
 const char *patchdl_appdb_error(void);
 void patchdl_appdb_free(patchdl_appinfo_t *arr);
 

@@ -9,13 +9,9 @@
 
 #pragma once
 
-/*
- * SCEI DNAS Root 05 — the private root CA that signs Sony's PS5 download CDN
- * (sgst/gst/gs2.prod.dl.playstation.net). Their version.xml is served over TLS
- * with this root, which is NOT in any public CA bundle, so it is embedded here
- * and passed to libcurl via CURLOPT_CAINFO_BLOB (no file written to disk).
- * Public, non-secret certificate (valid 2004-2037).
- */
+/* SCEI DNAS Root 05, Sony's private root behind the download CDN. not in any
+   public bundle, so it lives here and goes to curl as a blob. public cert,
+   valid until 2037 */
 static const char PATCHDL_SCEI_DNAS_ROOT_PEM[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIID0jCCArqgAwIBAgIBADANBgkqhkiG9w0BAQUFADBUMQswCQYDVQQGEwJKUDEp\n"

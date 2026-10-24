@@ -35,16 +35,13 @@
 #define PATCHDL_DNS_SAVE_FILE "/data/patchdl/dns_cache.txt"
 #endif
 
-/* Worst case with everything blocked: 4 x 1.2 s UDP, 2 x 2 s TCP, 3 x 4 s
-   DoH; about 21 s, once per host, then the failure is cached. */
+/* everything blocked costs ~21 s per host, then the failure is cached */
 #define UDP_TIMEOUT_MS   1200
 #define TCP_TIMEOUT_MS   2000
 #define DOH_TIMEOUT_S    4L
-#define POSITIVE_TTL_S   600     /* CDN edges rotate; ask again after 10 min */
+#define POSITIVE_TTL_S   600     /* CDN edges rotate */
 #define NEGATIVE_TTL_S   20      /* don't run the whole chain for every piece */
-/* patchdl_dns_forget leaves an answer alone while it is this fresh: many
-   workers stalling one after another must not refresh it over and over.
-   An answer that took long to get (blocked plain DNS) is kept longer. */
+/* forget() ignores answers this young, slow ones (blocked UDP) longer */
 #define FORGET_MIN_AGE_S       15
 #define FORGET_MIN_AGE_SLOW_S  120
 #define SLOW_LOOKUP_MS         3000
@@ -54,9 +51,8 @@
 static const char *PLAIN_SERVERS[] = { "1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1", NULL };
 static const char *TCP_SERVERS[]   = { "1.1.1.1", "8.8.8.8", NULL };
 
-/* DoH endpoints by name, pinned to an address so no DNS is needed to reach
-   them. The certificate is checked against the name. Only servers that
-   answer over HTTP/1.1: the SDK's libcurl has no HTTP/2 (Quad9 needs it). */
+/* pinned IPs, no DNS needed to reach DoH. HTTP/1.1 only, the SDK curl has
+   no HTTP/2, which is why Quad9 isn't here */
 #ifdef PATCHDL_HAVE_CURL
 static const struct { const char *name, *ip; } DOH_SERVERS[] = {
     { "cloudflare-dns.com", "1.1.1.1" },
@@ -65,8 +61,6 @@ static const struct { const char *name, *ip; } DOH_SERVERS[] = {
     { NULL, NULL },
 };
 #endif
-
-/* ---------- wire format ------------------------------------------------- */
 
 enum {
     ANS_OK = 0,
@@ -95,7 +89,6 @@ next_query_id(void) {
                       (unsigned)getpid());
 }
 
-/* Query for host's A record. Returns the length, or -1. */
 static int
 build_query(const char *host, uint16_t id, uint8_t *buf, size_t sz) {
     size_t      pos = 12;
@@ -122,7 +115,7 @@ build_query(const char *host, uint16_t id, uint8_t *buf, size_t sz) {
     return (int)pos;
 }
 
-/* Past a (possibly compressed) name; 0 on success. */
+/* handles compression pointers */
 static int
 skip_name(const uint8_t *r, size_t n, size_t *pos) {
     while (*pos < n) {
@@ -135,7 +128,7 @@ skip_name(const uint8_t *r, size_t n, size_t *pos) {
     return -1;
 }
 
-/* Addresses a filtering resolver answers with instead of the real one. */
+/* what filtering resolvers hand out instead of the real address */
 static int
 is_sinkhole(const uint8_t a[4]) {
     return a[0] == 0 || a[0] == 127 || a[0] == 10 || a[0] >= 224 ||
@@ -145,7 +138,7 @@ is_sinkhole(const uint8_t a[4]) {
            (a[0] == 100 && (a[1] & 0xC0) == 64);
 }
 
-/* q/qlen: the query sent; the reply must repeat its question. */
+/* the reply has to echo the question */
 static int
 parse_answer(const uint8_t *r, size_t n, uint16_t id, const uint8_t *q, size_t qlen,
              patchdl_dns_answer_t *out, char *sinkhole_ip, size_t sinkhole_sz) {
@@ -201,8 +194,6 @@ answer_text(int rc) {
     }
 }
 
-/* ---------- transports -------------------------------------------------- */
-
 static void
 trail_add(char *trail, size_t sz, const char *fmt, const char *a, const char *b) {
     size_t len = strlen(trail);
@@ -211,8 +202,6 @@ trail_add(char *trail, size_t sz, const char *fmt, const char *a, const char *b)
     snprintf(trail + len, sz - len, fmt, a, b);
 }
 
-/* Shared tail of every transport: parse, log the outcome, 0 on a usable
-   answer. */
 static int
 finish(const uint8_t *resp, size_t n, uint16_t id, const uint8_t *q, size_t qlen,
        patchdl_dns_answer_t *out, const char *label, char *trail, size_t trail_sz,
@@ -246,14 +235,13 @@ query_udp(const char *server, const char *host, patchdl_dns_answer_t *out,
     sa.sin_family = AF_INET;
     sa.sin_port = htons(53);
     sa.sin_addr.s_addr = inet_addr(server);
-    /* Connected socket: replies from anyone but this server are dropped. */
+    /* connected, so the kernel drops replies from anyone else */
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) || send(fd, q, (size_t)qlen, 0) != qlen) {
         trail_add(trail, trail_sz, "%s: %s", label, strerror(errno));
         close(fd);
         return -1;
     }
-    /* Skip stray datagrams (an older query's late answer) until ours or
-       the deadline. */
+    /* skip late answers to older queries */
     errno = EAGAIN;
     for (long long deadline = now_ms() + UDP_TIMEOUT_MS, left;
          (left = deadline - now_ms()) > 0;) {
@@ -276,8 +264,7 @@ query_udp(const char *server, const char *host, patchdl_dns_answer_t *out,
     return -1;
 }
 
-/* Send or receive exactly len bytes on a non-blocking socket before the
-   deadline. A server trickling bytes can't stretch the exchange. */
+/* hard deadline, so a server trickling bytes can't stretch it */
 static int
 io_until(int fd, uint8_t *buf, size_t len, int sending, long long deadline) {
     size_t done = 0;
@@ -295,7 +282,6 @@ io_until(int fd, uint8_t *buf, size_t len, int sending, long long deadline) {
     return 0;
 }
 
-/* One DNS exchange over TCP, connect included, within TCP_TIMEOUT_MS. */
 static int
 query_tcp(const char *server, const char *host, patchdl_dns_answer_t *out,
           char *trail, size_t trail_sz) {
@@ -428,11 +414,9 @@ query_doh(const char *name, const char *ip, const char *host,
 }
 #endif
 
-/* ---------- last-known-good addresses on disk --------------------------- */
-
 static pthread_mutex_t g_save_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* One line per host: "host ip,ip,...". */
+/* last good answers, one "host ip,ip,..." line per host */
 static int
 saved_get(const char *host, patchdl_dns_answer_t *out) {
     char  line[512];
@@ -467,9 +451,9 @@ saved_put(const char *host, const patchdl_dns_answer_t *a) {
     int   n = 0, fd;
     FILE *f;
 
-    if (!(lines = calloc(MAX_SAVED, sizeof *lines))) return;   /* 16 KB: heap, not stack */
+    if (!(lines = calloc(MAX_SAVED, sizeof *lines))) return;   /* 16 KB, keep it off the stack */
     pthread_mutex_lock(&g_save_mtx);
-    /* This host first, then the others it already knew. */
+    /* this host first, then the rest */
     snprintf(lines[n], sizeof lines[0], "%s ", host);
     for (int i = 0; i < a->n; i++) {
         size_t len = strlen(lines[n]);
@@ -499,8 +483,6 @@ saved_put(const char *host, const patchdl_dns_answer_t *a) {
     free(lines);
 }
 
-/* ---------- the chain --------------------------------------------------- */
-
 static int
 resolve_fresh(const char *host, patchdl_dns_answer_t *out) {
     char *trail = out->trail;
@@ -529,8 +511,6 @@ resolve_fresh(const char *host, patchdl_dns_answer_t *out) {
     return -1;
 }
 
-/* ---------- cache ------------------------------------------------------- */
-
 typedef struct {
     char                 host[256];
     patchdl_dns_answer_t ans;
@@ -539,7 +519,7 @@ typedef struct {
     time_t               expires;
     time_t               used;
     time_t               fetched;
-    int                  slow;     /* the lookup took > SLOW_LOOKUP_MS */
+    int                  slow;     /* took > SLOW_LOOKUP_MS */
 } cache_slot_t;
 
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -560,7 +540,7 @@ slot_find(const char *host) {
     return NULL;
 }
 
-/* A free slot, else the least recently used one nobody is resolving. */
+/* free slot, else LRU that isn't in flight */
 static cache_slot_t *
 slot_claim(const char *host) {
     cache_slot_t *pick = NULL;
@@ -587,11 +567,9 @@ patchdl_dns_lookup(const char *host, patchdl_dns_answer_t *out) {
     if (!host || !host[0] || strlen(host) >= sizeof g_cache[0].host) return -1;
 
     pthread_mutex_lock(&g_mtx);
-    /* One lookup per host at a time: the download workers all want the same
-       CDN host at once, and the others wait for its answer. While an answer
-       that merely aged out is being renewed, they keep using it instead: with
-       plain DNS blocked a renewal takes seconds. An answer dropped after a
-       failure (expires == 0) is not reused. */
+    /* one lookup per host, the other workers wait. an expired answer is
+       served while it renews (takes seconds when UDP is blocked), a
+       forgotten one (expires == 0) is not */
     for (;;) {
         s = slot_find(host);
         if (!s || !s->inflight) break;

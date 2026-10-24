@@ -22,8 +22,7 @@
 
 #include <ps5/kernel.h>
 
-/* Embed the tile assets into .rodata directly via .incbin — no codegen step,
-   no Python helper, no second translation unit. */
+/* .incbin straight into .rodata, no codegen step */
 #define INCASSET(name, file)                                                  \
     __asm__(".section .rodata\n"                                              \
             ".global " #name "\n"                                             \
@@ -41,8 +40,7 @@ INCASSET(tile_icon0_png,  "assets/icon0.png");
 
 #define TILE_TITLE_ID "PTDL00001"
 
-/* Forward decls — we resolve sceAppInstUtilInitialize/AppInstallTitleDir at
-   runtime via the kernel dynlib helpers so the ELF stays loader-friendly. */
+/* resolved at runtime, linking the sce libs breaks the elfldr */
 typedef int (*ai_init_fn)(void);
 typedef int (*ai_install_dir_fn)(const char *title_id, const char *parent_dir,
                                   void *opts);
@@ -69,9 +67,7 @@ write_all(const char *path, const uint8_t *data, size_t size) {
     ssize_t w;
     size_t  off = 0;
 
-    /* O_NOFOLLOW + 0600: don't follow a symlink at the destination, and don't
-       create the file with the libc default 0666 mode. Same pattern as the
-       net layer's fopen_safe. */
+    /* no symlink games, no 0666 (same as fopen_safe) */
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     while (off < size) {
@@ -130,14 +126,11 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
     snprintf(sce_sys_dir, sizeof sce_sys_dir, "/user/app/%s/sce_sys",          TILE_TITLE_ID);
     snprintf(param_path,  sizeof param_path,  "/user/app/%s/sce_sys/param.json", TILE_TITLE_ID);
     snprintf(icon_path,   sizeof icon_path,   "/user/app/%s/sce_sys/icon0.png",  TILE_TITLE_ID);
-    /* Written only after the installer accepted the tile. Without it, files
-       left behind by a failed registration would pass the stat-guard below
-       and the tile would never be retried. */
+    /* written once the installer took the tile, or leftovers from a failed
+       register would pass the stat-guard forever */
     snprintf(receipt_path, sizeof receipt_path, "/user/app/%s/.patchdl_registered", TILE_TITLE_ID);
 
-    /* stat-guard: if everything on disk already matches, do nothing. Re-running
-       the install API every payload start would be wasted work and burns the
-       only safe path through Sony's installer state machine. */
+    /* stat-guard: don't bother the installer on every start */
     {
         struct stat st;
         if (stat(receipt_path, &st) == 0 &&
@@ -148,10 +141,8 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
         }
     }
 
-    /* AppInstUtil is loaded lazily by the install backend thread. Poke it +
-       poll briefly so libSceAppInstUtil.sprx is mapped before we try to
-       resolve symbols out of it. Bounded to a few seconds so a stuck init
-       doesn't wedge an MHD worker forever. */
+    /* the backend thread maps libSceAppInstUtil.sprx lazily. wait max 15 s,
+       a stuck init must not hang an MHD worker */
     {
         char    ready_msg[128];
         int     ready = -1;
@@ -166,15 +157,12 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
         }
     }
 
-    /* Resolve the install API now so we can fail fast before touching disk.
-       The symbol export is Sony-private, so the NID resolver is the more
-       reliable lookup — try NID first, fall back to the by-name dlsym. */
+    /* Sony-private export: NID first, name as fallback */
     ai_install_title = (ai_install_dir_fn)dynsym_by_nid("Wudg3Xe3heE");
     if (!ai_install_title)
         ai_install_title = (ai_install_dir_fn)dynsym_by_name(
             "sceAppInstUtilAppInstallTitleDir");
-    /* Firmware 13.xx no longer exports AppInstallTitleDir. AppInstallAll
-       rescans /user/app and registers the tile directory the same way. */
+    /* gone on fw 13.xx. AppInstallAll rescans /user/app, same result */
     if (!ai_install_title)
         ai_install_all = (ai_install_all_fn)dynsym_by_name(
             "sceAppInstUtilAppInstallAll");
@@ -187,9 +175,6 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
     ai_initialize = (ai_init_fn)dynsym_by_name("sceAppInstUtilInitialize");
     if (ai_initialize) {
         rc = ai_initialize();
-        /* SCE_OK == 0; a non-zero rc here usually means "already initialised"
-           in this process, which is fine. We only bail on a clearly fatal
-           code (anything that isn't already the success case). */
         if (rc != 0 && rc != 0x80B21161 /* ALREADY_INITIALIZED */) {
             snprintf(msg, msg_sz,
                      "sceAppInstUtilInitialize failed 0x%08x", (unsigned)rc);
@@ -206,14 +191,11 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
         return -1;
     }
 
-    /* The home screen keeps the section (Games or Media) a tile was first
-       registered in. A tile from an older PatchDL sits under Games; take
-       it off before registering it again so it moves to Media. Only ever
-       PatchDL's own tile id is passed here. */
+    /* a tile stays in the section (Games/Media) it was first registered in.
+       old ones sit in Games, so uninstall first. only ever PatchDL's own id */
     {
         struct stat st;
-        /* an older param.json on disk, whether or not the receipt exists
-           (tiles from before 0.0.7 have none) */
+        /* old param.json, receipt or not (pre-0.0.7 tiles have none) */
         was_registered = stat(param_path, &st) == 0 &&
                          !file_matches(param_path, tile_param_json, tile_param_json_size);
     }

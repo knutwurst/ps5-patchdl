@@ -48,21 +48,19 @@ static patchdl_title_t *g_titles;
 static size_t           g_title_count;
 static pthread_mutex_t  g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char            *g_debug_json; /* built once at startup */
-/* Background version.xml fetch thread. Joinable so shutdown can wait for it
-   before patchdl_scan_free frees g_titles out from under it. */
+/* version.xml thread, joinable so shutdown can wait for it
+   before g_titles gets freed */
 static pthread_t        g_verxml_tid;
 static int              g_verxml_started;
 static volatile int     g_verxml_stop;
-/* Automatic rescan of the installed titles (see scan_watch_thread). */
+/* auto rescan, see scan_watch_thread */
 static pthread_t        g_scan_tid;
 static int              g_scan_started;
 static volatile int     g_scan_stop;
 static volatile int     g_scan_now;       /* set by /api/rescan */
-/* Bumped under g_mutex whenever the title list or a title's update info
-   changes, so the UI knows when to reload /api/titles. */
+/* bumped under g_mutex on any title list change, UI reloads /api/titles */
 static unsigned long    g_titles_gen;
-/* Duration of the last rescan's steps in ms (scan, waiting for the
-   version.xml thread, total), for /api/status. */
+/* rescan ms: scan, verxml wait, total */
 static long             g_rescan_ms[3];
 static const char *volatile g_rescan_step = "idle";
 static volatile long    g_rescan_since;
@@ -75,33 +73,27 @@ mono_ms(void) {
 }
 static unsigned long    g_pkg_hits;
 static char             g_pkg_diag_json[768] = "{\"hits\":0}";
-/* Recent /api/pkg requests (Sony's installer pulling a package), oldest
-   overwritten first, so a test can see every file it asked for. */
+/* ring of the last /api/pkg requests */
 #define PKG_LOG_LINES 32
 static char             g_pkg_log[PKG_LOG_LINES][200];
 static unsigned         g_pkg_log_next;
-/* Title whose package the console fetched last, and when. While the console
-   is still fetching, the package must not be rewritten or deleted. */
+/* last package fetch by the console. hands off the pkg while it reads */
 static char             g_pkg_last_tid[16];
 static time_t           g_pkg_last_time;
 #define INSTALL_QUIET_SECS 60
-/* Progress of each install, measured on our side: Sony reads the package
-   (tail first, then front to back) and fetches the .crc last. Its own status
-   query fails (0x80A30003) for these installs, so this is what the UI shows.
-   One entry per title, so installs started by "Update all" don't overwrite
-   each other's tracking and post-install check. Guarded by g_mutex. */
+/* install progress counted on PatchDL's side, Sony's own status query just
+   says 0x80A30003 here. one entry per title. g_mutex */
 typedef struct {
     char      title_id[16];
-    long long read;        /* distinct package bytes served (Sony reads the
-                              tail first and may re-read ranges) */
+    long long read;        /* distinct bytes served, Sony re-reads */
     int       nspans;      /* served byte ranges, sorted, merged */
     struct { long long a, b; } span[48];
-    long long total;       /* package size */
+    long long total;
     int       crc;         /* the .crc was fetched: reading is over */
     time_t    started, last;
-    char      version[16]; /* version the package installs */
-    char      file[160];   /* package file name under /data/patchdl/<title>/ */
-    int       checked;     /* post-install check ran */
+    char      version[16];
+    char      file[160];   /* package file in the title folder */
+    int       checked;
     int       verified;    /* 1: installed and from this package, -1: not shown */
     int       deleted;     /* package removed after the check (setting on) */
     int       claiming;    /* an install request is starting it right now */
@@ -110,16 +102,13 @@ typedef struct {
 #define MAX_STREAMS 8
 static install_stream_t g_streams[MAX_STREAMS];
 
-/* Add the served range [a,b) and recount the distinct bytes. Ranges are
-   kept sorted and merged; Sony reads mostly in order, so few remain. If the
-   table is full the range is dropped: the count then stays low (safe),
-   never high. Call with g_mutex held. */
+/* add [a,b) and recount. full table drops the range, so the count errs
+   low, never high. g_mutex held */
 static void
 stream_cover(install_stream_t *st, long long a, long long b) {
     int i, j;
     if (b <= a) return;
     for (i = 0; i < st->nspans && st->span[i].b < a; i++) ;
-    /* i: first span that ends at or after a; merge every span touching [a,b) */
     for (j = i; j < st->nspans && st->span[j].a <= b; j++) {
         if (st->span[j].a < a) a = st->span[j].a;
         if (st->span[j].b > b) b = st->span[j].b;
@@ -134,7 +123,7 @@ stream_cover(install_stream_t *st, long long a, long long b) {
     for (i = 0; i < st->nspans; i++) st->read += st->span[i].b - st->span[i].a;
 }
 
-/* The title's install entry, or NULL. Call with g_mutex held. */
+/* g_mutex held */
 static install_stream_t *
 stream_find(const char *title_id) {
     for (int i = 0; i < MAX_STREAMS; i++)
@@ -144,10 +133,8 @@ stream_find(const char *title_id) {
     return NULL;
 }
 
-/* Sony has read everything: every byte went out, or (it may skip ranges)
-   it fetched the .crc and then went quiet for a minute. The .crc alone
-   proves nothing: it was seen fetched at 88% of the package. Call with
-   g_mutex held. */
+/* all bytes out, or .crc fetched plus a quiet minute. the .crc alone proves
+   nothing, I've seen it fetched at 88%. g_mutex held */
 static int
 stream_read_all(const install_stream_t *st) {
     int quiet = time(NULL) - st->last >= INSTALL_QUIET_SECS;
@@ -159,10 +146,6 @@ stream_read_all(const install_stream_t *st) {
 
 #define INSTALL_STALL_SECS 300
 
-/* waiting: started, nothing read yet; reading: Sony pulls the package;
-   finishing: everything was read and Sony is still busy (or the check is
-   pending); done: checked after a minute of quiet; stalled: five minutes
-   without progress before the package was read through. */
 static const char *
 stream_phase(const install_stream_t *st, time_t now) {
     int read_all = stream_read_all(st);
@@ -172,10 +155,7 @@ stream_phase(const install_stream_t *st, time_t now) {
     return "done";
 }
 
-/* Persisted, user-editable settings. Per-title enable/disable lives in the
-   title structs (t->enabled) so it travels with the scan; the global fields
-   live here. Both are saved to PATCHDL_CFG_PATH (homebrew data dir, never a
-   system file) and reloaded on the next start. Guarded by g_mutex. */
+/* settings in PATCHDL_CFG_PATH, per-title enable is in the title structs */
 #define POOL_MAX_CONN 16
 #define POOL_MAX_JOBS 16
 #define SIDECAR_MAX_HAVE 64   /* started pieces remembered in the sidecar */
@@ -184,17 +164,14 @@ static struct {
     char default_policy[8];        /* "deny" | "allow" */
     int  install_after_download;
     int  delete_pkg_after_install;
-    int  verify_downloads;         /* SHA-256 each manifest piece (default off) */
-    int  home_shortcut;            /* user wants a home-screen browser tile */
-    int  max_connections;          /* parallel download connections (1..POOL_MAX_CONN) */
-    char download_drive[32];       /* "/data" or a mounted drive like "/mnt/ext1" */
+    int  verify_downloads;         /* SHA-256 every piece, default off */
+    int  home_shortcut;            /* home-screen tile */
+    int  max_connections;          /* 1..POOL_MAX_CONN */
+    char download_drive[32];       /* /data, /mnt/extN or /mnt/usbN */
 } g_cfg = { "deny", 0, 1, 0, 1, 4, "/data" };
 
-/* ---------- download connection pool ----------------------------------- */
-/* N worker threads share one job at a time (admit_max=1): a single download
-   spreads its pieces across all N connections; extra titles queue. Resume uses
-   a per-piece done-bitmap in the sidecar so an out-of-order parallel download
-   survives a reboot. All pool state is guarded by g_pool.mtx (NOT g_mutex). */
+/* workers share one job, extra titles queue. the sidecar bitmap survives
+   reboots. lock: g_pool.mtx, not g_mutex */
 
 typedef enum { PC_PENDING = 0, PC_INFLIGHT, PC_DONE, PC_FAILED } pc_state_t;
 
@@ -203,12 +180,10 @@ typedef struct {
     int        attempts;
     int        slot;       /* worker slot while INFLIGHT, else -1 */
     long       retry_at;   /* mono_ms() before which a failed piece waits */
-    long long  have;       /* bytes of a failed piece already on disk, to resume */
+    long long  have;       /* synced bytes of a failed piece, to resume */
 } dl_pstate_t;
 
-/* A piece that fails on the network is tried again after a growing pause,
-   so a dropped connection or a stalled CDN edge for a few minutes doesn't
-   end the download. Hash mismatches fail at once. */
+/* network errors retry with backoff, hash mismatches fail at once */
 #define PIECE_MAX_ATTEMPTS 8
 static long
 piece_backoff_ms(int attempts) {
@@ -234,63 +209,55 @@ typedef struct dl_job {
     int                is_manifest;
     int                verify;
     job_state_t        state;
-    unsigned int       seq;            /* bumped on cancel; stale completions discarded */
+    unsigned int       seq;            /* bumped on cancel, stale results dropped */
     volatile int       abort;          /* read by the piece transfer callback */
     long long          total;          /* assembled size (preallocated) */
-    long long          done_bytes;     /* sum of DONE piece sizes (committed) */
+    long long          done_bytes;     /* sum of DONE pieces */
     long long          speed_bps;
     long long          sample_bytes;
     double             sample_ts;
-    patchdl_manifest_t mf;             /* pieces (url/offset/size/hash) */
-    dl_pstate_t       *ps;             /* per-piece runtime state, mf.count entries */
-    unsigned char     *bitmap;         /* (count+7)/8; bit set == DONE + durable */
+    patchdl_manifest_t mf;
+    dl_pstate_t       *ps;
+    unsigned char     *bitmap;         /* bit set = DONE and on disk */
     int                pieces_done;
     int                pieces_failed;
     int                inflight;
-    int                fd;             /* O_RDWR dest fd, -1 until admit */
+    int                fd;             /* -1 until admit */
     int                rc;             /* 0 ok, -1 net/io, -2 verify, -3 no space */
     long long          need_bytes;     /* rc -3: bytes the package still needed */
-    int                verifying;      /* admit is hashing a package found on disk */
-    int                in_admit;       /* admit_next holds this job with the lock dropped */
-    long long          verify_bytes;   /* bytes hashed so far */
-    long long          free_bytes;     /* rc -3: bytes free on that drive at the time */
-    int                space_install;  /* rc -3: short because the install needs room too */
-    int                last_curl_rc;   /* CURLcode from the most recent piece */
-    char               fail_step[24];  /* why admit failed (manifest fetch), or "" */
-    long               last_http_code; /* HTTP status from the most recent piece */
+    int                verifying;      /* admit is hashing a pkg found on disk */
+    int                in_admit;       /* admit_next has it, lock dropped */
+    long long          verify_bytes;
+    long long          free_bytes;     /* rc -3: free bytes on that drive */
+    int                space_install;  /* rc -3: the install needs room too */
+    int                last_curl_rc;   /* CURLcode of the last piece */
+    char               fail_step[24];  /* why the manifest fetch failed, or "" */
+    long               last_http_code; /* HTTP status of the last piece */
     struct dl_job     *next;
 } dl_job_t;
 
 static struct {
     pthread_mutex_t mtx;
     pthread_cond_t  cv;                /* workers wait; broadcast on any change */
-    dl_job_t       *jobs;              /* linked list, queue order */
+    dl_job_t       *jobs;
     dl_job_t       *active;            /* the one admitted job, or NULL */
-    int             admitting;         /* a worker is fetching/preallocating next job */
+    int             admitting;         /* admit in progress */
     int             stopping;
-    int             n_workers;         /* threads actually spawned (== POOL_MAX_CONN) */
-    int             active_conns;      /* live connection limit (1..n_workers); a worker
-                                          with slot >= active_conns idles. Changing this
-                                          + broadcast resizes the pool with no restart. */
+    int             n_workers;
+    int             active_conns;      /* workers with slot >= this idle */
     pthread_t       workers[POOL_MAX_CONN];
-    volatile long long inflight_bytes[POOL_MAX_CONN]; /* per-slot live counters */
+    volatile long long inflight_bytes[POOL_MAX_CONN];
 } g_pool = { .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
-#define PATCHDL_DATA_DIR  "/data/patchdl"      /* config and caches; always internal */
+#define PATCHDL_DATA_DIR  "/data/patchdl"      /* config and caches, always internal */
 #define PATCHDL_CFG_PATH  "/data/patchdl/config.json"
 
-/* ---------- download drives ---------------------------------------------
-   Packages live in <drive>/patchdl/<title>/. The drive is the internal
-   storage (/data) or a mounted drive (/mnt/extN for extended storage and
-   M.2, /mnt/usbN for USB). A title's folder stays where its download
-   started: lookups check every drive first, and only a title without a
-   folder anywhere goes to the drive chosen in Settings. */
+/* <drive>/patchdl/<title>/, a title stays where its download started */
 
 #define MAX_DRIVES 12
 
-/* Guards g_cfg.download_drive for current_root, which runs with the pool
-   lock held too: a leaf lock, taken after g_mutex or g_pool.mtx and never
-   holding anything else. Writers hold g_mutex as well. */
+/* guards g_cfg.download_drive. leaf lock, taken after g_mutex or
+   g_pool.mtx, nothing under it */
 static pthread_mutex_t g_drive_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static int
@@ -300,7 +267,6 @@ drive_name_ok(const char *m) {
            isdigit((unsigned char)m[8]) && (!m[9] || (isdigit((unsigned char)m[9]) && !m[10]));
 }
 
-/* The drive is mounted right now (an unplugged USB drive is not). */
 static int
 drive_mounted(const char *drive) {
     struct statfs sf;
@@ -308,14 +274,13 @@ drive_mounted(const char *drive) {
     return statfs(drive, &sf) == 0 && !strcmp(sf.f_mntonname, drive);
 }
 
-/* /data first, then every mounted extN/usbN drive. Returns the count. */
+/* /data first, then every mounted extN/usbN */
 static int
 list_drives(char out[][32], int max) {
     struct statfs *mnt;
     int            n = 0, k;
     snprintf(out[n++], 32, "/data");
-    /* getfsstat into our own buffer: getmntinfo shares a static one, and
-       this runs on several threads at once */
+    /* own buffer, getmntinfo's static one isn't thread-safe */
     k = getfsstat(NULL, 0, MNT_NOWAIT);
     if (k <= 0 || !(mnt = calloc((size_t)k + 4, sizeof *mnt))) return n;
     k = getfsstat(mnt, (long)(((size_t)k + 4) * sizeof *mnt), MNT_NOWAIT);
@@ -329,8 +294,7 @@ list_drives(char out[][32], int max) {
     return n;
 }
 
-/* Where new downloads go: <chosen drive>/patchdl, or the internal storage
-   while the chosen drive isn't there. */
+/* chosen drive, or /data while that one isn't mounted */
 static void
 current_root(char *out, size_t sz) {
     char drive[32];
@@ -341,8 +305,7 @@ current_root(char *out, size_t sz) {
     snprintf(out, sz, "%s/patchdl", drive);
 }
 
-/* The title's folder: an existing one on any drive, else one on the
-   current drive. title_id must already be a safe path segment. */
+/* existing folder on any drive, else the current one. title_id must be safe */
 static void
 title_dir(const char *title_id, char *out, size_t sz) {
     char        drives[MAX_DRIVES][32], root[64];
@@ -356,7 +319,6 @@ title_dir(const char *title_id, char *out, size_t sz) {
     snprintf(out, sz, "%s/%s", root, title_id);
 }
 
-/* mkdir the folder and its patchdl parent. */
 static void
 make_title_dir(const char *dir) {
     char parent[288];
@@ -369,8 +331,7 @@ make_title_dir(const char *dir) {
     mkdir(dir, 0777);
 }
 
-/* The source policy and CDN allowlist are fixed (the safety model), so they
-   stay constant; only the four mutable fields above are user-controlled. */
+/* source policy and CDN allowlist are fixed (safety model), not settings */
 static const char config_tail_json[] =
   "\"source_policy\":{"
   "\"official\":{\"allow_check\":true,\"allow_download\":true,\"allow_install\":true},"
@@ -385,9 +346,8 @@ static const char config_tail_json[] =
   "\"gs2.ww.prod.dl.playstation.net\","
   "\"gs-sec.ww.np.dl.playstation.net\""
   "]}";
-/* ---------- tiny JSON value lookups (flat objects only) ----------------- */
+/* tiny JSON lookups, flat objects only */
 
-/* Find `"key"` then the following `true`/`false`; returns dflt if absent. */
 static int
 json_get_bool(const char *s, const char *key, int dflt) {
     char pat[64];
@@ -417,10 +377,7 @@ json_get_int(const char *s, const char *key, int dflt) {
     return (int)strtol(p, NULL, 10);
 }
 
-/* Find `"key":"value"` and copy value into out. Decodes the common JSON
-   string escapes (\" \\ \/ \n \r \t \b \f). \uXXXX is collapsed to '?' —
-   we don't accept multi-byte content in any field here. An unknown escape
-   keeps the payload byte. */
+/* \uXXXX becomes '?', no field needs multi-byte */
 static void
 json_get_str(const char *s, const char *key, char *out, size_t sz) {
     out[0] = '\0';
@@ -448,8 +405,6 @@ json_get_str(const char *s, const char *key, char *out, size_t sz) {
             case 'b':  out[i++] = '\b'; break;
             case 'f':  out[i++] = '\f'; break;
             case 'u':
-                /* \uXXXX: not needed for any field we accept; drop to '?' so
-                   neither the surrogate pair nor the hex digits leak. */
                 if (p[1] && p[2] && p[3] && p[4]) p += 4;
                 out[i++] = '?';
                 break;
@@ -463,7 +418,6 @@ json_get_str(const char *s, const char *key, char *out, size_t sz) {
     out[i] = '\0';
 }
 
-/* ---------- JSON builder ------------------------------------------------ */
 
 typedef struct {
     char  *buf;
@@ -471,14 +425,14 @@ typedef struct {
     size_t cap;
 } jbuf_t;
 
-/* 0 when there is room for extra more bytes plus the NUL. */
+/* 0 if extra bytes plus the NUL fit */
 static int
 jbuf_ensure(jbuf_t *j, size_t extra) {
     if (!j->buf || j->len + extra + 1 > j->cap) {
         size_t newcap = (j->cap + extra + 1) * 2;
         if (newcap < 1024) newcap = 1024;
         char *p = realloc(j->buf, newcap);
-        if (!p) return -1;      /* the old buffer stays, but too small */
+        if (!p) return -1;      /* old buffer stays, just too small */
         j->buf = p;
         j->cap = newcap;
     }
@@ -526,7 +480,6 @@ jbuf_append_ver_or_null(jbuf_t *j, const char *ver) {
         jbuf_append(j, "null");
 }
 
-/* ---------- HTTP helpers ------------------------------------------------ */
 
 static enum MHD_Result
 queue_buffer(struct MHD_Connection *conn, unsigned int status,
@@ -537,10 +490,7 @@ queue_buffer(struct MHD_Connection *conn, unsigned int status,
 
     resp = MHD_create_response_from_buffer(size, (void *)data, mm);
     if (!resp) {
-        /* MUST_FREE hands ownership to MHD on success; on failure we still
-           own it and have to free it ourselves or the caller's strdup'd
-           JSON leaks. PERSISTENT/MUST_COPY buffers are caller-owned and
-           we leave them alone. */
+        /* MUST_FREE is only MHD's on success, free it here or it leaks */
         if (mm == MHD_RESPMEM_MUST_FREE) free((void *)data);
         return MHD_NO;
     }
@@ -567,7 +517,7 @@ queue_json(struct MHD_Connection *conn, unsigned int status, const char *json) {
                         json, strlen(json), MHD_RESPMEM_PERSISTENT);
 }
 
-/* Takes ownership of json — MHD will free() it */
+/* takes ownership, MHD frees it */
 static enum MHD_Result
 queue_json_owned(struct MHD_Connection *conn, unsigned int status, char *json) {
     if (!json) return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
@@ -575,9 +525,7 @@ queue_json_owned(struct MHD_Connection *conn, unsigned int status, char *json) {
                         json, strlen(json), MHD_RESPMEM_MUST_FREE);
 }
 
-/* Serve a title's icon from the fd the scan opened. Icons don't change while
-   PatchDL runs, so the browser may cache them; the card list re-renders on
-   every poll and would otherwise refetch all of them. */
+/* icons never change and cards re-render every poll, let the browser cache */
 static enum MHD_Result
 queue_icon(struct MHD_Connection *conn, const char *title_id) {
     struct MHD_Response *resp;
@@ -586,7 +534,7 @@ queue_icon(struct MHD_Connection *conn, const char *title_id) {
     unsigned char       *buf;
     int                  fd = -1;
 
-    /* dup under the lock: a rescan closes the old list's icon fds. */
+    /* dup under the lock, a rescan closes the old icon fds */
     pthread_mutex_lock(&g_mutex);
     for (size_t i = 0; i < g_title_count; i++)
         if (!strcmp(g_titles[i].title_id, title_id)) {
@@ -640,9 +588,7 @@ path_segment_safe(const char *s) {
     return 1;
 }
 
-/* Validate a local PKG path for /api/install_aip: must be exactly
-   <drive>/patchdl/<safe-title-id>/<safe-filename>. Rejects anything
-   outside a download drive, anything with .. or unsafe chars. */
+/* only <drive>/patchdl/<safe-title-id>/<safe-file> */
 static int
 local_install_path_safe(const char *path) {
     char        drives[MAX_DRIVES][32], prefix[64];
@@ -674,8 +620,7 @@ local_install_path_safe(const char *path) {
     return path_segment_safe(tail);
 }
 
-/* Whitelist of CDN hosts /api/install_uri may target. Mirrors
-   ALLOWED_HOSTS in patchdl_net.c — kept in sync by hand. */
+/* subset of ALLOWED_HOSTS in patchdl_net.c, kept in sync by hand */
 static const char *INSTALL_URI_HOSTS[] = {
     "sgst.prod.dl.playstation.net",
     "gst.prod.dl.playstation.net",
@@ -683,9 +628,7 @@ static const char *INSTALL_URI_HOSTS[] = {
     NULL,
 };
 
-/* Validate an install URI for /api/install_uri: must be https:// to one of
-   INSTALL_URI_HOSTS (or a subdomain). Rejects file://, http://, redirects
-   to other hosts (libcurl enforces via host_allowed at fetch time). */
+/* host in INSTALL_URI_HOSTS or a subdomain, redirects go via host_allowed */
 static int
 cdn_host_ok(const char *host_start) {
     const char *end;
@@ -741,8 +684,7 @@ pkg_reader_cb(void *cls, uint64_t pos, char *buf, size_t max) {
     n = pread(r->fd, buf, max, (off_t)(r->start + pos));
     if (n <= 0)
         return MHD_CONTENT_READER_END_WITH_ERROR;
-    /* Publish progress as bytes actually go out, at most once a second and
-       at the end of the response; a long request must not look idle. */
+    /* max once a second plus at the end, so long requests don't look idle */
     if (time(NULL) != r->noted || pos + (uint64_t)n >= r->size) {
         r->noted = time(NULL);
         note_pkg_served(r, pos + (uint64_t)n);
@@ -786,8 +728,7 @@ record_pkg_diag(const char *url, const char *range, unsigned int status,
     pthread_mutex_unlock(&g_mutex);
 }
 
-/* Bytes of a package response went out: the console is still reading, and
-   for the tracked install this is how far it got. */
+/* console is still reading, for a tracked install this is its progress */
 static void
 note_pkg_served(pkg_reader_t *r, uint64_t sent) {
     pthread_mutex_lock(&g_mutex);
@@ -805,11 +746,8 @@ note_pkg_served(pkg_reader_t *r, uint64_t sent) {
     pthread_mutex_unlock(&g_mutex);
 }
 
-/* The console fetched this title's package within the last minute: an
-   install is reading it. Per title through its install entry, so a second
-   install running at the same time doesn't hide the first; the most recent
-   request covers an install PatchDL has no entry for (started before a
-   restart). */
+/* fetched in the last minute. per title, the last-request check covers
+   installs from before a restart */
 static int
 install_reading(const char *title_id) {
     const install_stream_t *st;
@@ -817,8 +755,7 @@ install_reading(const char *title_id) {
     int    busy;
     pthread_mutex_lock(&g_mutex);
     st   = stream_find(title_id);
-    /* an install PatchDL started stays protected until it was checked or
-       gave up, even through long pauses between the console's requests */
+    /* own installs stay protected until checked or stalled */
     busy = (st && (st->claiming ||
                    (!st->checked && strcmp(stream_phase(st, now), "stalled")))) ||
            (g_pkg_last_tid[0] && !strncmp(g_pkg_last_tid, title_id, 9) &&
@@ -827,8 +764,7 @@ install_reading(const char *title_id) {
     return busy;
 }
 
-/* Serve a downloaded package back to Sony's installer over localhost. This is
-   only for files PatchDL already placed under /data/patchdl/<title>/<pkg>. */
+/* serve a downloaded pkg back to Sony's installer over localhost */
 static enum MHD_Result
 queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     const char *prefix = "/api/pkg/";
@@ -956,10 +892,8 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     return ret;
 }
 
-/* ---------- status JSON ------------------------------------------------- */
 
-/* statvfs of the drive holding `path` (in this process's view). A folder
-   that doesn't exist yet counts as its closest existing parent. */
+/* a folder that doesn't exist yet counts as its closest existing parent */
 static int
 statvfs_up(const char *path, struct statvfs *vfs) {
     char p[288], *slash;
@@ -971,7 +905,6 @@ statvfs_up(const char *path, struct statvfs *vfs) {
     }
 }
 
-/* Free space on the drive holding `path`, in MB. 0 if unavailable. */
 static long long
 drive_free_mb(const char *path) {
     struct statvfs vfs;
@@ -980,9 +913,7 @@ drive_free_mb(const char *path) {
                         (unsigned long long)vfs.f_frsize) / (1024ULL * 1024ULL));
 }
 
-/* Free bytes on a game's drive, -1 if it can't be measured. Game paths
-   (/user/app/<id>, /mnt/extN/user/app/<id>) only resolve through the
-   system root the scanner keeps. */
+/* -1 if unknown. game paths only resolve through the scanner's system root */
 static long long
 game_free_bytes(const char *game_dir) {
     struct statvfs vfs;
@@ -990,9 +921,7 @@ game_free_bytes(const char *game_dir) {
     return (long long)((unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize);
 }
 
-/* The download folder and the game sit on the same drive. The two paths
-   live in different views of the filesystem, so compare the file system
-   id, and failing that its exact size. */
+/* the two paths live in different fs views, so compare fsid, else size */
 static int
 same_drive(const char *dl_dir, const char *game_dir) {
     struct statvfs a, b;
@@ -1002,25 +931,21 @@ same_drive(const char *dl_dir, const char *game_dir) {
     return a.f_blocks == b.f_blocks && a.f_frsize == b.f_frsize;
 }
 
-/* Free space where new downloads go, in MB. */
 static long long
 data_free_mb(void) {
     char root[64], *slash;
     current_root(root, sizeof root);
-    if ((slash = strrchr(root, '/'))) *slash = '\0';   /* the drive itself */
+    if ((slash = strrchr(root, '/'))) *slash = '\0';
     return drive_free_mb(root);
 }
 
-/* Headroom kept free on /data so a download never fills the console's
-   internal storage to the last byte. */
+/* headroom, a download never fills the drive to the last byte */
 #define PATCHDL_SPACE_MARGIN (2LL * 1024 * 1024 * 1024)
 
-/* Extra room asked for on the game's drive before an install, on top of the
-   package size. A guess: the installer's exact need isn't known. */
+/* extra room for the install on the game's drive. a guess */
 #define INSTALL_SPACE_MARGIN (1LL * 1024 * 1024 * 1024)
 
-/* Bytes still to be written for a package of `total` bytes at `path`: a
-   partial from an earlier run already occupies part of it. */
+/* a partial from an earlier run already takes part of it */
 static long long
 space_needed(const char *path, long long total) {
     struct stat st;
@@ -1029,8 +954,6 @@ space_needed(const char *path, long long total) {
     return total > have ? total - have : 0;
 }
 
-/* 1 if `need` bytes plus the margin fit on the drive holding `dir`;
-   *free_out gets the free bytes. */
 static int
 space_ok(const char *dir, long long need, long long *free_out) {
     long long free_b = drive_free_mb(dir) * 1024LL * 1024LL;
@@ -1038,12 +961,7 @@ space_ok(const char *dir, long long need, long long *free_out) {
     return need + PATCHDL_SPACE_MARGIN <= free_b;
 }
 
-/* Is there room to download what's missing of a package and then install
-   it? The install needs about the package's size again on the game's drive
-   (game_dir); on the drive of the download folder (dl_dir) the two share
-   the free space. 1 if it fits. Otherwise *need_out / *free_out describe
-   the drive that is short and *for_install says whether the install part
-   made it short. */
+/* the install needs the pkg size again on the game's drive, shared if same */
 static int
 download_and_install_fit(const char *dl_dir, const char *game_dir,
                          long long remaining, long long total,
@@ -1072,11 +990,8 @@ download_and_install_fit(const char *dl_dir, const char *game_dir,
     return 1;
 }
 
-/* Built fresh per request so free space stays live (a 60+ GB download moves
-   it a lot). g_fw is read-only after startup, so this is thread-safe. */
-/* The console's LAN address, so a page opened on the PS5 itself (127.0.0.1)
-   can hand a phone a reachable link. Connecting a UDP socket sends nothing;
-   it only makes the kernel pick the outgoing interface. */
+/* LAN IP for the phone link. connecting a UDP socket sends nothing, it
+   just picks the interface */
 static void
 lan_ipv4(char *out, size_t sz) {
     struct sockaddr_in a;
@@ -1096,9 +1011,7 @@ lan_ipv4(char *out, size_t sz) {
     close(s);
 }
 
-/* Download folders are named after a title id (PPSA12345); /data/patchdl
-   also holds PatchDL's own data ("db"), which must never be listed or
-   deleted as a download. */
+/* title id folders only, <drive>/patchdl also holds the "db" folder */
 static int
 is_title_dir_name(const char *n) {
     if (strlen(n) != 9) return 0;
@@ -1107,8 +1020,7 @@ is_title_dir_name(const char *n) {
     return 1;
 }
 
-/* Bytes in <drive>/patchdl/<title>/ folders on every drive, for the
-   storage tile. */
+/* all drives, for the storage tile */
 static long long
 downloads_bytes(void) {
     DIR           *d, *sd;
@@ -1179,10 +1091,8 @@ build_status_json(void) {
     return out;
 }
 
-/* ---------- config persistence (/data/patchdl/config.json) -------------- */
 
-/* Serialize the current global settings; the fixed source policy + allowlist
-   are appended from config_tail_json. Caller owns the result (queue_json_owned). */
+/* policy + allowlist come from config_tail_json */
 static char *
 build_config_json(void) {
     char head[384], root[64];
@@ -1212,8 +1122,7 @@ build_config_json(void) {
     return out;
 }
 
-/* Write global settings + per-title enabled flags. Must NOT be called while
-   holding g_mutex (it takes the lock itself). */
+/* takes g_mutex itself, don't call with it held */
 static void
 save_config(void) {
     FILE *f;
@@ -1239,8 +1148,8 @@ save_config(void) {
     for (size_t i = 0; i < g_title_count; i++)
         fprintf(f, "%s\"%s\":%s", i ? "," : "",
                 g_titles[i].title_id, g_titles[i].enabled ? "true" : "false");
-    /* Sideloaded titles the user switched on, kept apart so a switch saved
-       before sideloaded titles started off can't turn one on. */
+    /* kept separate so a switch saved before sideloads defaulted to off
+       can't turn one on */
     fprintf(f, "},\n\"sideload_updates\":{");
     for (size_t i = 0, n = 0; i < g_title_count; i++)
         if (g_titles[i].sideloaded && g_titles[i].enabled)
@@ -1251,10 +1160,7 @@ save_config(void) {
     fclose(f);
 }
 
-/* Load persisted settings over the defaults. Called once at startup, after the
-   scan, while still single-threaded. */
-/* The whole config file, malloc'd and NUL-terminated, or NULL. It holds a
-   switch per title (twice for sideloaded ones), so no fixed buffer. */
+/* one switch per title, so no fixed buffer */
 static char *
 read_config_file(void) {
     FILE  *f = fopen(PATCHDL_CFG_PATH, "r");
@@ -1274,7 +1180,7 @@ read_config_file(void) {
     return buf;
 }
 
-/* Per-title overrides live under "titles": { "<id>": true|false, ... }. */
+/* "titles" for normal ones, "sideload_updates" for sideloads */
 static void
 overlay_title_policy(const char *cfg, patchdl_title_t *arr, size_t cnt) {
     const char *titles = strstr(cfg, "\"titles\"");
@@ -1287,6 +1193,7 @@ overlay_title_policy(const char *cfg, patchdl_title_t *arr, size_t cnt) {
     }
 }
 
+/* startup only, after the scan, still single-threaded */
 static void
 load_config(void) {
     char  *buf = read_config_file();
@@ -1325,8 +1232,7 @@ load_config(void) {
     free(buf);
 }
 
-/* Per-title switches for a freshly scanned list: unknown sources start off,
-   a saved choice from config.json wins, and a fake package stays off. */
+/* unknown sources start off, a saved choice wins, fakes stay off */
 static void
 apply_title_policy(patchdl_title_t *arr, size_t cnt) {
     char *buf = read_config_file();
@@ -1341,10 +1247,8 @@ apply_title_policy(patchdl_title_t *arr, size_t cnt) {
             arr[i].enabled = 0;
 }
 
-/* ---------- titles JSON (built per request under mutex) ----------------- */
 
-/* A pasted Prospero link only counts while its version is newer than the
-   installed one; the link and its package stay on disk until Cancel. */
+/* a pasted link counts while it's newer than installed, stays until Cancel */
 static int
 manual_pending(const patchdl_title_t *t) {
     return t->manual_url[0] &&
@@ -1354,18 +1258,15 @@ manual_pending(const patchdl_title_t *t) {
 static const char *
 title_status_str(const patchdl_title_t *t) {
     if (!t->verxml_done)                          return "checking";
-    /* A mounted image can't take a patch, so neither download nor install
-       would lead anywhere; treat it like a fake package. */
+    /* a mounted image can't take a patch, same as fake */
     if (t->source_type == PATCHDL_SOURCE_UNKNOWN ||
         t->source_type == PATCHDL_SOURCE_FAKE ||
         t->source_type == PATCHDL_SOURCE_SHADOWMOUNT) return "blocked";
     if (t->compatible_version[0]) {
-        /* Versions are zero-padded (01.000.011), so strcmp orders them.
-           A compatible patch newer than what's installed = update available. */
+        /* versions are zero-padded (01.000.011), strcmp orders them */
         if (t->installed_version[0] &&
             strcmp(t->compatible_version, t->installed_version) <= 0) {
-            /* Nothing installable, but a newer patch exists that needs a
-               newer firmware: say so instead of claiming up to date. */
+            /* a newer patch exists but needs newer firmware */
             if (t->latest_version[0] &&
                 strcmp(t->latest_version, t->installed_version) > 0)
                 return "incompatible_fw";
@@ -1433,9 +1334,8 @@ build_titles_json(void) {
         jbuf_appendf(&j, ",\"patch_storage_match\":%s",
                      (!t->patch_storage_title_id[0] ||
                       !strncmp(t->patch_storage_title_id, t->title_id, 9)) ? "true" : "false");
-        /* This is the target title id parsed from version.xml/manifest_url.
-           CDN storage paths may use another regional/master title id; that is
-           not exposed here and must not block a valid target match. */
+        /* patch_title_id is from version.xml. the CDN storage id may differ by
+           region and must not block the match */
         jbuf_appendf(&j, ",\"patch_title_match\":%s",
                      (!t->patch_title_id[0] ||
                       !strncmp(t->patch_title_id, t->title_id, 9)) ? "true" : "false");
@@ -1464,7 +1364,7 @@ build_titles_json(void) {
     jbuf_append(&j, "]");
 
     pthread_mutex_unlock(&g_mutex);
-    return j.buf; /* caller owns; use queue_json_owned */
+    return j.buf;
 }
 
 static const char *
@@ -1481,8 +1381,7 @@ job_state_str(job_state_t s) {
     }
 }
 
-/* List every download in the pool (queued/active/paused/done/error) with live
-   bytes = committed done_bytes + in-flight piece bytes. */
+/* live bytes = committed + in flight */
 static char *
 build_downloads_json(void) {
     jbuf_t j = {0};
@@ -1496,7 +1395,7 @@ build_downloads_json(void) {
         if (job == g_pool.active)
             for (int s = 0; s < g_pool.n_workers; s++)
                 bytes += g_pool.inflight_bytes[s];
-        /* started pieces waiting to be continued (a paused job too) */
+        /* started pieces, paused jobs too */
         if (job->ps)
             for (int i = 0; i < job->mf.count; i++)
                 if (job->ps[i].state == PC_PENDING) bytes += job->ps[i].have;
@@ -1518,7 +1417,6 @@ build_downloads_json(void) {
         jbuf_appendf(&j, ",\"progress\":%d", progress);
         if (job->verifying) jbuf_append(&j, ",\"verifying\":true");
         if (job->state == JOB_ACTIVE && job->ps) {
-            /* pieces waiting out a pause before their next try */
             long now = mono_ms();
             int  waiting = 0;
             for (int i = 0; i < job->mf.count; i++)
@@ -1543,7 +1441,6 @@ build_downloads_json(void) {
     return j.buf;
 }
 
-/* ---------- verxml background fetch ------------------------------------ */
 
 static void *
 verxml_fetch_thread(void *arg) {
@@ -1554,17 +1451,15 @@ verxml_fetch_thread(void *arg) {
         char              url[512] = {0};
         patchdl_verinfo_t info;
 
-        if (g_verxml_stop) break;   /* shutdown: stop before the next blocking query */
-        /* checked before a rescan; a stop between the version.xml result
-           and the Prospero lookup leaves the lookup to do */
+        if (g_verxml_stop) break;   /* stop before the next blocking query */
+        /* done before a rescan, maybe only the Prospero lookup is left */
         if (t->verxml_done &&
             (t->prospero_done || strcmp(title_status_str(t), "incompatible_fw")))
             continue;
         memset(&info, 0, sizeof(info));
 
 
-        /* The version.xml URL comes straight from the app.db (UUID included);
-           fall back to the resolver only if the app.db had no entry. */
+        /* version.xml URL from app.db (with UUID), resolver as fallback */
         if (t->version_file_uri[0])
             patchdl_verxml_query(t->version_file_uri, g_fw.bin, &info);
         else if (!patchdl_resolve_url(t->title_id, url, sizeof(url)))
@@ -1589,13 +1484,10 @@ verxml_fetch_thread(void *arg) {
         g_titles_gen++;
         pthread_mutex_unlock(&g_mutex);
 
-        /* No automatic cleanup of a finished download: app.db can report the
-           new version while the patch content was never applied, and deleting
-           the package then loses it. The user removes it with Cancel. */
+        /* no auto cleanup: app.db may show the new version while the patch
+           never got applied */
 
-        /* When the latest patch needs newer firmware and no compatible
-           version came from Sony, ask Prospero Patches for the full
-           version history. */
+        /* latest needs newer fw: ask Prospero Patches for the whole history */
         if (g_verxml_stop) break;
         if (!strcmp(title_status_str(t), "incompatible_fw") &&
             t->source_type != PATCHDL_SOURCE_FAKE &&
@@ -1620,9 +1512,8 @@ verxml_fetch_thread(void *arg) {
     return NULL;
 }
 
-/* ---------- title action helper ---------------------------------------- */
 
-/* Snapshot the fields an action needs, under the lock. Returns 0 if found. */
+/* snapshot under the lock, 1 if found */
 static int
 get_title_action_info(const char *title_id, patchdl_source_t *src,
                       char *patch_url, size_t url_sz,
@@ -1654,8 +1545,7 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
             strncpy(version, g_titles[i].compatible_version, ver_sz - 1);
             version[ver_sz - 1] = '\0';
             if (manual_pending(&g_titles[i])) {
-                /* A pasted Prospero link wins: it is the title's own package
-                   (checked on submit), so no delta and no shared master. */
+                /* pasted link wins, it's the title's own pkg (checked on submit) */
                 snprintf(patch_url, url_sz, "%s", g_titles[i].manual_url);
                 delta_url[0] = '\0';
                 snprintf(patch_title_id, pt_sz, "%.9s", title_id);
@@ -1671,7 +1561,6 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
     return found;
 }
 
-/* Persist a per-title enable/disable toggle. */
 static enum MHD_Result
 set_title_enabled(struct MHD_Connection *conn, const char *title_id, int en) {
     int found = 0;
@@ -1680,7 +1569,7 @@ set_title_enabled(struct MHD_Connection *conn, const char *title_id, int en) {
     pthread_mutex_lock(&g_mutex);
     for (size_t i = 0; i < g_title_count; i++) {
         if (!strcmp(g_titles[i].title_id, title_id)) {
-            /* Fake packages stay off; the toggle can't switch them on. */
+            /* fakes stay off */
             if (g_titles[i].source_type == PATCHDL_SOURCE_FAKE) en = 0;
             g_titles[i].enabled = en;
             found = 1;
@@ -1696,12 +1585,8 @@ set_title_enabled(struct MHD_Connection *conn, const char *title_id, int en) {
     return queue_json_owned(conn, MHD_HTTP_OK, strdup(r));
 }
 
-/* Local on-disk path a title's patch downloads to / installs from. The
-   basename comes from the patch_url (CDN-controlled), so it MUST be
-   validated — a malicious or corrupted version.xml could otherwise yield
-   "..", an empty string, or a path with delimiters that escape the title
-   directory when concatenated. Fallback to a deterministic per-title name
-   on any rejection so file ops still land somewhere safe. */
+/* the name comes from the CDN, validate it or a bad version.xml walks
+   out of the folder */
 static void
 title_pkg_path(const char *title_id, const char *patch_url,
                char *out, size_t out_sz) {
@@ -1732,7 +1617,6 @@ url_is_manifest(const char *url) {
 }
 
 
-/* ---------- resume sidecar + pool helpers ------------------------------- */
 
 static void
 title_state_path(const char *title_id, char *out, size_t sz) {
@@ -1748,8 +1632,7 @@ remove_dl_state(const char *title_id) {
     unlink(path);
 }
 
-/* Delete a title's download folder and its contents. Best-effort; only ever
-   touches <drive>/patchdl/<title> (self-protecting against a bad segment). */
+/* only ever touches <drive>/patchdl/<title> */
 static void remove_dir_files(const char *dir);
 
 static void
@@ -1760,7 +1643,6 @@ remove_title_dir(const char *title_id) {
     remove_dir_files(dir);
 }
 
-/* Delete the files in one flat download folder, then the folder. */
 static void
 remove_dir_files(const char *dir) {
     char           path[560];
@@ -1778,7 +1660,6 @@ remove_dir_files(const char *dir) {
     rmdir(dir);
 }
 
-/* ---------- user-supplied patch link (Prospero) ------------------------ */
 
 static void
 manual_source_path(const char *title_id, char *out, size_t sz) {
@@ -1787,8 +1668,7 @@ manual_source_path(const char *title_id, char *out, size_t sz) {
     snprintf(out, sz, "%s/manual.json", dir);
 }
 
-/* Persist the pasted link next to the download so install and resume still
-   find it after a restart. Cancel deletes the directory, and with it this. */
+/* next to the download so it survives a restart, Cancel deletes it */
 static void
 save_manual_source(const char *title_id, const char *url, const char *version) {
     char  dir[288], path[320];
@@ -1822,11 +1702,10 @@ clear_manual_source(const char *title_id) {
     manual_source_path(title_id, path, sizeof path);
     unlink(path);
     title_dir(title_id, dir, sizeof dir);
-    rmdir(dir);   /* fails while the pkg is still there; the cancel path removes it */
+    rmdir(dir);   /* fails while the pkg is still there, cancel removes it */
 }
 
-/* Restore the pasted link saved next to a download. Runs on a list that is
-   not published yet (startup, or a rescan before the swap). */
+/* list isn't published yet (startup, or a rescan before the swap) */
 static void
 load_manual_sources(patchdl_title_t *arr, size_t cnt) {
     for (size_t i = 0; i < cnt; i++) {
@@ -1843,16 +1722,14 @@ load_manual_sources(patchdl_title_t *arr, size_t cnt) {
         buf[n] = '\0';
         json_get_str(buf, "url", t->manual_url, sizeof t->manual_url);
         json_get_str(buf, "version", t->manual_version, sizeof t->manual_version);
-        /* Keep the link and its package even if app.db already reports this
-           version: an install can register the version without applying the
-           patch, so the package may still be needed. Cancel removes it. */
+        /* keep it even if app.db shows this version, the install may not have
+           applied the patch */
         if (!url_is_manifest(t->manual_url) || !t->manual_version[0])
             t->manual_url[0] = t->manual_version[0] = '\0';
     }
 }
 
-/* Mirror the resumable flag into g_titles (read by /api/titles). Takes g_mutex,
-   so it must be called with the POOL lock NOT held (lock order: g_mutex first). */
+/* takes g_mutex, so not with the pool lock held (g_mutex first) */
 static void
 set_title_resumable(const char *title_id, int resumable, long long bytes) {
     pthread_mutex_lock(&g_mutex);
@@ -1877,7 +1754,6 @@ set_title_downloaded(const char *title_id, int downloaded) {
     pthread_mutex_unlock(&g_mutex);
 }
 
-/* Installed version is at least `version`: nothing left to fetch. */
 static int
 version_installed(const char *title_id, const char *version) {
     int done = 0;
@@ -1930,9 +1806,7 @@ hex_to_bitmap(const char *hex, unsigned char *bm, int nbytes) {
     }
 }
 
-/* Write the job's resume sidecar atomically. Each set bit's bytes were already
-   fdatasync'd in patchdl_http_download_piece, so a set bit implies durable data.
-   Called with the pool lock held (the write is tiny). */
+/* set bits were fdatasync'd already. pool lock held, the write is tiny */
 static void
 write_job_state(const dl_job_t *job) {
     char  path[320], tmp[340], *hex;
@@ -1952,8 +1826,7 @@ write_job_state(const dl_job_t *job) {
                 "\"piece_count\":%d,\"done_bytes\":%lld,\"done\":\"%s\",\"have\":\"",
                 job->manifest_url, job->version, job->total, job->mf.count,
                 job->done_bytes, hex);
-        /* "piece:bytes" for started pieces; `have` only ever holds bytes
-           that were synced to disk (see dl_worker) */
+        /* piece:bytes of started pieces, synced bytes only */
         for (int i = 0; job->ps && i < job->mf.count && listed < SIDECAR_MAX_HAVE; i++)
             if (job->ps[i].state != PC_DONE && job->ps[i].have > 0)
                 fprintf(f, "%s%d:%lld", listed++ ? "," : "", i, job->ps[i].have);
@@ -1964,8 +1837,7 @@ write_job_state(const dl_job_t *job) {
     free(hex);
 }
 
-/* Bytes on disk for a paused or failed job: finished pieces plus the synced
-   parts of started ones. Pool lock held. */
+/* finished pieces plus the synced part of started ones. pool lock held */
 static long long
 partial_bytes_locked(const dl_job_t *job) {
     long long b = job->done_bytes;
@@ -1974,15 +1846,11 @@ partial_bytes_locked(const dl_job_t *job) {
     return b;
 }
 
-/* Seed a freshly-admitted job's piece states from its resume sidecar — only if
-   it belongs to THIS manifest (same url + size + piece count). Sets DONE bits,
-   ps[] states and done_bytes. Called with the pool lock held. */
+/* only if it's for this manifest (url, size, piece count). pool lock held */
 static void
 seed_from_sidecar(dl_job_t *job) {
-    /* 8 KB sidecar buffer: 4096-piece cap × 2 hex chars / 8 bits = 1024 hex
-       chars for the bitmap, plus the JSON wrapper and the up-to-768-byte
-       manifest_url — fits with room. Halved from 16 KB to lighten the
-       per-admit stack frame on the pool worker. */
+    /* 8 KB fits 4096 pieces of bitmap hex, the have list and manifest_url.
+       bigger hurts the worker's stack */
     char       path[320], buf[8192], murl[768];
     FILE      *f;
     size_t     n;
@@ -1999,7 +1867,7 @@ seed_from_sidecar(dl_job_t *job) {
     if (strcmp(murl, job->manifest_url) ||
         json_get_ll(buf, "total", -1) != job->total ||
         json_get_int(buf, "piece_count", -1) != job->mf.count)
-        return;   /* stale / different patch -> start fresh */
+        return;   /* different patch, start fresh */
 
     {
         size_t hexsz = (size_t)nbytes * 2 + 1;
@@ -2014,7 +1882,6 @@ seed_from_sidecar(dl_job_t *job) {
             job->ps[i].state = PC_DONE;
             job->done_bytes += job->mf.pieces[i].size;
         }
-    /* started pieces continue where they stopped */
     {
         char        have[SIDECAR_MAX_HAVE * 24];
         const char *p = have;
@@ -2034,21 +1901,17 @@ seed_from_sidecar(dl_job_t *job) {
     }
 }
 
-/* ---------- pool scheduler + workers ------------------------------------ */
 
 static int
 pick_pending_piece(const dl_job_t *job, long now) {
-    /* pieces are stored in ascending offset order -> first PENDING is lowest;
-       a piece waiting out its retry pause is skipped */
+    /* first PENDING is the lowest offset, skip retry pauses */
     for (int i = 0; i < job->mf.count; i++)
         if (job->ps[i].state == PC_PENDING && job->ps[i].retry_at <= now) return i;
     return -1;
 }
 
-/* Milliseconds until the next pending piece may start (0 if one already
-   may), or -1 when no piece is pending. Takes the same `now` as
-   pick_pending_piece, so a pause ending in between can't look like "nothing
-   left". Pool lock held. */
+/* -1 if none pending. same now as pick_pending_piece, or an expiring
+   pause looks like nothing left */
 static long
 next_retry_in_ms(const dl_job_t *job, long now) {
     long best = -1;
@@ -2060,10 +1923,8 @@ next_retry_in_ms(const dl_job_t *job, long now) {
     return best;
 }
 
-/* Wait on the pool condition, but no longer than ms (ms < 0: no limit).
-   The timed wait runs on the wall clock, which the console may set back
-   (time sync); waiting at most a second per call keeps that from parking a
-   retry, since the caller checks the monotonic deadlines again. */
+/* timed wait runs on the wall clock, and time sync can set that back.
+   max a second per call, the caller rechecks the monotonic deadlines */
 static void
 pool_wait_locked(long ms) {
     struct timespec ts;
@@ -2076,7 +1937,7 @@ pool_wait_locked(long ms) {
     pthread_cond_timedwait(&g_pool.cv, &g_pool.mtx, &ts);
 }
 
-/* Unlink a job from the list and free it. Pool lock held. */
+/* pool lock held */
 static void
 free_job_locked(dl_job_t *job) {
     dl_job_t **pp = &g_pool.jobs;
@@ -2089,8 +1950,7 @@ free_job_locked(dl_job_t *job) {
     free(job);
 }
 
-/* Cancel finalize: delete the file + sidecar and drop the job. Pool lock held
-   on entry/exit; dropped briefly for set_title_resumable (g_mutex). */
+/* pool lock held, dropped briefly for the g_mutex calls */
 static void
 finalize_cancel_locked(dl_job_t *job) {
     char title_id[32], dir[288], dest[320];
@@ -2098,7 +1958,7 @@ finalize_cancel_locked(dl_job_t *job) {
     snprintf(dir, sizeof dir, "%s", job->dir);
     snprintf(dest, sizeof dest, "%s", job->dest);
     if (g_pool.active == job) g_pool.active = NULL;
-    free_job_locked(job);                 /* closes fd, frees job */
+    free_job_locked(job);
     remove_title_dir(title_id);           /* pkg, sidecar, .crc, link */
     pthread_mutex_unlock(&g_pool.mtx);
     set_title_resumable(title_id, 0, 0);
@@ -2106,8 +1966,7 @@ finalize_cancel_locked(dl_job_t *job) {
     pthread_mutex_lock(&g_pool.mtx);
 }
 
-/* Pause finalize: keep the partial, persist the bitmap, mark resumable. The job
-   stays in the list as JOB_PAUSED. Pool lock held on entry/exit. */
+/* job stays as PAUSED, partial kept. pool lock held */
 static void
 finalize_pause_locked(dl_job_t *job) {
     char      title_id[32];
@@ -2124,8 +1983,7 @@ finalize_pause_locked(dl_job_t *job) {
     pthread_mutex_lock(&g_pool.mtx);
 }
 
-/* Settle an active job whose pieces are all done or some failed. Pool lock held
-   on entry/exit. */
+/* all pieces done or some failed. pool lock held */
 static void
 settle_active_locked(dl_job_t *job) {
     char title_id[32], dir[288], dest[320];
@@ -2136,9 +1994,7 @@ settle_active_locked(dl_job_t *job) {
     if (job->fd >= 0) { close(job->fd); job->fd = -1; }
 
     if (job->pieces_failed == 0 && job->pieces_done == job->mf.count) {
-        /* complete: keep the .pkg and a sidecar with every piece done, so a
-           restart still knows the package is whole and a new download of the
-           same manifest finishes without fetching anything */
+        /* keep a full sidecar so the pkg still counts as whole after a restart */
         job->state = JOB_DONE;
         write_job_state(job);
         pthread_mutex_unlock(&g_pool.mtx);
@@ -2146,9 +2002,9 @@ settle_active_locked(dl_job_t *job) {
         set_title_downloaded(title_id, 1);
         pthread_mutex_lock(&g_pool.mtx);
     } else if (job->rc == -2) {
-        /* corrupt (failed SHA-256): delete, not resumable */
+        /* failed SHA-256, delete, not resumable */
         job->state = JOB_FAILED;
-        write_job_state(job);   /* harmless; overwritten by delete below */
+        write_job_state(job);   /* removed right below anyway */
         unlink(dest);
         remove_dl_state(title_id);
         rmdir(dir);
@@ -2156,7 +2012,7 @@ settle_active_locked(dl_job_t *job) {
         set_title_resumable(title_id, 0, 0);
         pthread_mutex_lock(&g_pool.mtx);
     } else {
-        /* network failure on a piece after retries: keep partial, resumable */
+        /* network failure after retries, keep the partial */
         long long done = partial_bytes_locked(job);
         job->state = JOB_FAILED;
         write_job_state(job);
@@ -2166,9 +2022,8 @@ settle_active_locked(dl_job_t *job) {
     }
 }
 
-/* A package the user copied in (or one left from an older PatchDL) may carry
-   another file name. If the expected file is missing and exactly one .pkg in
-   the folder has the manifest's size, take it under the expected name. */
+/* a pkg copied in by hand may have another name: one .pkg of the right
+   size gets taken */
 static int
 adopt_by_size(const char *dir, const char *dest, long long total) {
     DIR           *d;
@@ -2192,8 +2047,7 @@ adopt_by_size(const char *dir, const char *dest, long long total) {
     return hits == 1 && rename(found, dest) == 0;
 }
 
-/* The title's sidecar belongs to this manifest (same check as
-   seed_from_sidecar), so its bitmap already says which pieces are good. */
+/* same check as seed_from_sidecar */
 static int
 sidecar_matches(const char *title_id, const char *murl, long long total, int count) {
     char   path[320], buf[8192], url[768];
@@ -2210,10 +2064,8 @@ sidecar_matches(const char *title_id, const char *murl, long long total, int cou
            json_get_int(buf, "piece_count", -1) == count;
 }
 
-/* Hash every piece of a package already on disk against the manifest and
-   set the bit of each piece that matches. Runs in admit with the pool lock
-   dropped; q stays valid (admit is its sole finalizer) and a cancel or pause
-   only flags it, which ends the check early. */
+/* pool lock dropped. q stays valid (admit is its only finalizer),
+   cancel/pause end it early */
 static void
 verify_existing(dl_job_t *q, int fd, const patchdl_manifest_t *mf,
                 unsigned char *done) {
@@ -2222,7 +2074,7 @@ verify_existing(dl_job_t *q, int fd, const patchdl_manifest_t *mf,
     pthread_mutex_lock(&g_pool.mtx);
     q->verifying = 1;
     q->verify_bytes = 0;
-    q->total = mf->total;            /* for the progress bar; admit sets it again */
+    q->total = mf->total;            /* for the progress bar, admit sets it again */
     pthread_mutex_unlock(&g_pool.mtx);
     for (int i = 0; i < mf->count; i++) {
         char hex[80];
@@ -2243,9 +2095,7 @@ verify_existing(dl_job_t *q, int fd, const patchdl_manifest_t *mf,
     }
 }
 
-/* Promote the head QUEUED job to ACTIVE: fetch+parse manifest, preallocate the
-   file, seed the resume bitmap. Network/disk I/O runs with the pool lock
-   DROPPED. Pool lock held on entry/exit. */
+/* QUEUED head to ACTIVE. network and disk run without the pool lock */
 static void
 admit_next(void) {
     dl_job_t          *q = NULL;
@@ -2268,9 +2118,8 @@ admit_next(void) {
 
     g_pool.admitting = 1;
     q->in_admit = 1;
-    q->state = JOB_ADMITTING;       /* NOT claimable; a cancel/pause mid-admit only
-                                       flags it — admit_next is the sole finalizer.
-                                       g_pool.active stays NULL until fully built. */
+    q->state = JOB_ADMITTING;       /* cancel/pause only flag it,
+                                       admit_next finalizes */
     is_manifest = q->is_manifest;
     snprintf(murl, sizeof murl, "%s", q->manifest_url);
     snprintf(dest, sizeof dest, "%s", q->dest);
@@ -2278,7 +2127,7 @@ admit_next(void) {
     snprintf(q_title, sizeof q_title, "%s", q->title_id);
     pthread_mutex_unlock(&g_pool.mtx);
 
-    /* ---- network + disk, NO pool lock ---- */
+    /* network + disk, no pool lock */
     memset(&mf, 0, sizeof mf);
     make_title_dir(dir);
     if (is_manifest) {
@@ -2289,10 +2138,7 @@ admit_next(void) {
             total = mf.total;
             adopted = adopt_by_size(dir, dest, total);
             need  = space_needed(dest, total);
-            /* The install needs about the package's size again on the
-               game's drive. Check that now, before downloading something
-               that can't be installed: on the same drive the download and
-               the install share the free space. */
+            /* the install needs the pkg size again on the game's drive */
             {
                 char gdir[256] = "";
                 pthread_mutex_lock(&g_mutex);
@@ -2313,27 +2159,20 @@ admit_next(void) {
                 if (ftruncate(fd, (off_t)total) == 0) ok = 1;
                 else { close(fd); fd = -1; }
             }
-            /* The console asks for "<name>.crc" next to the package at the
-               end of an install; /api/pkg serves it from here. */
+            /* the console asks for <name>.crc at the end of an install */
             if (ok && mf.crc_url[0]) {
                 char crc[320];
                 struct stat cst;
                 size_t n = strlen(dest);
                 if (n > 4 && !strcmp(dest + n - 4, ".pkg") && n < sizeof crc) {
                     snprintf(crc, sizeof crc, "%.*s.crc", (int)(n - 4), dest);
-                    /* Best effort: the pieces don't depend on it, and a
-                       later download of the same manifest tries again. */
+                    /* best effort, the next run retries */
                     if (stat(crc, &cst) != 0 || cst.st_size == 0)
                         (void)patchdl_http_download(mf.crc_url, crc, NULL);
                 }
             }
-            /* A whole package is already here but no sidecar says which
-               pieces are good (finished before sidecars were kept, copied in
-               by hand, or downloaded again after a restart): hash it against
-               the manifest instead of fetching everything again. */
-            /* A sidecar only describes the file it was written for: when the
-               package is gone or shorter (deleted by hand, fresh file), drop
-               it; when a file was adopted, hash it instead of trusting it. */
+            /* a sidecar only fits its own file. shorter or missing pkg: drop it,
+               adopted or sidecar-less pkg: hash it instead of fetching again */
             if (ok && old_size < total)
                 remove_dl_state(q->title_id);
             else if (ok && (adopted ||
@@ -2348,7 +2187,7 @@ admit_next(void) {
         if (mf.pieces) {
             mf.pieces[0].url = strdup(murl);
             mf.pieces[0].offset = 0;
-            mf.pieces[0].size = 0;         /* unknown -> size check skipped */
+            mf.pieces[0].size = 0;         /* unknown, no size check */
             mf.count = 1; mf.total = 0; total = 0;
             fd = open(dest, O_RDWR | O_CREAT | O_TRUNC, 0666);
             if (fd >= 0 && mf.pieces[0].url) ok = 1;
@@ -2364,9 +2203,8 @@ admit_next(void) {
     pthread_mutex_lock(&g_pool.mtx);
     g_pool.admitting = 0;
     q->in_admit = 0;
-    /* During the unlocked I/O window do_cancel/do_pause may have flagged q
-       (it stays JOB_ADMITTING otherwise). The job was never published as
-       g_pool.active, so no worker touched it and q is still valid here. */
+    /* cancel/pause may have flagged q meanwhile. never published, so no
+       worker touched it */
     q->verifying = 0;
     if (!ok || q->state == JOB_CANCELLING) {
         if (fd >= 0) close(fd);
@@ -2381,8 +2219,7 @@ admit_next(void) {
             q->need_bytes = need;
             q->free_bytes = free_b;
             q->space_install = space_inst;
-            /* the manifest fetch failed: say where, so a report can tell a
-               blocked host from a TLS or HTTP problem */
+            /* tells a blocked host from TLS or HTTP trouble */
             snprintf(q->fail_step, sizeof q->fail_step, "%s", fstep);
             q->last_curl_rc   = fcurl;
             q->last_http_code = fhttp;
@@ -2390,11 +2227,8 @@ admit_next(void) {
         pthread_cond_broadcast(&g_pool.cv);
         return;
     }
-    /* Resume of a previously paused job reuses the same dl_job_t, which still
-       carries the prior mf/ps/bitmap and a committed done_bytes. Free the stale
-       buffers and zero the committed counters before attaching the fresh ones so
-       the sidecar bitmap is the single source of truth (no leak, no double-count).
-       Harmless on a fresh job: mf is zeroed, ps/bitmap are NULL, free(NULL) is ok. */
+    /* a resumed job still has the old mf/ps/bitmap. drop them, the sidecar
+       is the only truth */
     patchdl_manifest_free(&q->mf);
     free(q->ps);     q->ps     = NULL;
     free(q->bitmap); q->bitmap = NULL;
@@ -2404,17 +2238,14 @@ admit_next(void) {
 
     q->mf = mf; q->ps = ps; q->bitmap = bitmap; q->fd = fd; q->total = total;
     for (int i = 0; i < mf.count; i++) q->ps[i].slot = -1;
-    /* a single package is fetched again from scratch (it was just
-       truncated), so an old sidecar says nothing about it */
+    /* a single pkg was just truncated, the old sidecar is moot */
     if (is_manifest) seed_from_sidecar(q);
     q->pieces_done = 0;
     for (int i = 0; i < mf.count; i++)
         if (q->ps[i].state == PC_DONE) q->pieces_done++;
-    /* A shorter file without a sidecar is not trusted as a prefix: it may
-       have holes or foreign bytes. Its pieces are fetched again (or found
-       by verify_existing when the file is whole). */
+    /* a shorter file without sidecar isn't trusted as a prefix (holes) */
     (void)old_size;
-    /* Pieces of a whole package found on disk that matched their hash. */
+    /* whole pkg on disk: take the pieces that matched their hash */
     if (q->pieces_done == 0 && pre_done) {
         for (int i = 0; i < mf.count; i++)
             if (pre_done[i / 8] & (1 << (i % 8))) {
@@ -2426,9 +2257,7 @@ admit_next(void) {
         if (q->pieces_done > 0) write_job_state(q);
     }
     free(pre_done);
-    /* A pause that landed during admit: persist the seeded/migrated bitmap and
-       park as PAUSED (keeping the on-disk partial) rather than starting the
-       transfer. finalize_pause_locked writes the sidecar and closes the fd. */
+    /* paused during admit: save the bitmap and park instead of starting */
     if (q->state == JOB_PAUSING) {
         finalize_pause_locked(q);
         pthread_cond_broadcast(&g_pool.cv);
@@ -2456,10 +2285,7 @@ dl_worker(void *arg) {
         pthread_mutex_lock(&g_pool.mtx);
         for (;;) {
             if (g_pool.stopping) break;
-            /* Live connection limit: a worker above the configured count idles
-               here (claims no new piece, doesn't admit). Lowering active_conns
-               lets in-flight pieces finish first, then those workers park here;
-               raising it wakes them to start pulling pieces — no restart. */
+            /* live connection limit, workers above it idle here */
             if (slot >= g_pool.active_conns) {
                 pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
                 continue;
@@ -2481,7 +2307,7 @@ dl_worker(void *arg) {
                 if (pidx >= 0) break;                 /* claim below */
                 wait = next_retry_in_ms(job, now);
                 if (job->inflight == 0 && wait < 0) { settle_active_locked(job); pthread_cond_broadcast(&g_pool.cv); continue; }
-                pool_wait_locked(wait);               /* wakes for a retry pause ending, too */
+                pool_wait_locked(wait);               /* a retry pause ending wakes it too */
                 continue;
             }
             if (job->state == JOB_PAUSING || job->state == JOB_CANCELLING) {
@@ -2498,7 +2324,6 @@ dl_worker(void *arg) {
         }
         if (g_pool.stopping) { pthread_mutex_unlock(&g_pool.mtx); break; }
 
-        /* claim piece pidx */
         job->ps[pidx].state = PC_INFLIGHT;
         job->ps[pidx].slot  = slot;
         job->inflight++;
@@ -2514,7 +2339,7 @@ dl_worker(void *arg) {
         g_pool.inflight_bytes[slot] = have;
         pthread_mutex_unlock(&g_pool.mtx);
 
-        /* ---- download the piece, NO lock ---- */
+        /* download the piece, no lock */
         int  last_curl_rc   = 0;
         long last_http_code = 0;
         {
@@ -2523,9 +2348,7 @@ dl_worker(void *arg) {
                                              verify && hash[0] ? hash : NULL, &ctx,
                                              &last_curl_rc, &last_http_code);
         }
-        /* A stopped piece (failure or pause) keeps what arrived only once
-           it is on disk: `have` may end up in the sidecar and be trusted
-           after a restart. */
+        /* keep a partial only once it's on disk, have may go into the sidecar */
         synced = rc == -1 && g_pool.inflight_bytes[slot] > have && fdatasync(fd) == 0;
 
         pthread_mutex_lock(&g_pool.mtx);
@@ -2538,40 +2361,32 @@ dl_worker(void *arg) {
         }
         job->ps[pidx].slot = -1;
         if (my_seq != job->seq) {
-            /* job cancelled/torn down under us: discard result (do not touch
-               bitmap/counters); the finalizer runs once inflight hits 0 */
+            /* cancelled meanwhile: drop it, finalizer runs at inflight 0 */
         } else if (rc == 0) {
             job->ps[pidx].state = PC_DONE;
             job->pieces_done++;
             job->done_bytes += sz;
             job->bitmap[pidx / 8] |= (unsigned char)(1 << (pidx % 8));
-            /* Persist after every completed piece: the bytes were already
-               fdatasync'd, and a tiny atomic sidecar write means an unclean
-               kill re-downloads only the pieces still in flight, not a batch
-               of up-to-8 already-finished ones. */
+            /* save after every piece, a kill then loses only what's in flight */
             write_job_state(job);
         } else if (job->abort &&
                    (job->state == JOB_PAUSING || job->state == JOB_CANCELLING)) {
-            job->ps[pidx].state = PC_PENDING;   /* aborted by pause -> continue on resume */
+            job->ps[pidx].state = PC_PENDING;   /* paused, continue on resume */
             if (synced && written < sz) job->ps[pidx].have = written;
         } else if (rc == -2 && have > 0) {
-            /* a continued piece failed its hash: the kept part may be what
-               is wrong, so fetch the whole piece once more before calling
-               the package corrupt */
+            /* the kept part may be the bad one, refetch the whole piece once */
             job->ps[pidx].have     = 0;
             job->ps[pidx].state    = PC_PENDING;
             job->ps[pidx].retry_at = 0;
         } else if (rc == -2) {
             job->ps[pidx].state = PC_FAILED; job->pieces_failed++; job->rc = -2;
         } else if (rc == -3) {
-            /* the server can't continue where the piece stopped: start it
-               over right away, without spending an attempt */
+            /* server can't resume mid-piece: start over now, no attempt used */
             job->ps[pidx].have     = 0;
             job->ps[pidx].state    = PC_PENDING;
             job->ps[pidx].retry_at = 0;
         } else {
-            /* keep what arrived (and was synced) so the next try continues
-               there; otherwise the part that was already safe stays */
+            /* keep what arrived and was synced, the next try continues there */
             if (synced && written < sz) job->ps[pidx].have = written;
             job->ps[pidx].attempts++;
             if (job->ps[pidx].attempts < PIECE_MAX_ATTEMPTS) {
@@ -2587,12 +2402,8 @@ dl_worker(void *arg) {
     return NULL;
 }
 
-/* ---------- HTTP handlers (enqueue/pause/cancel) ------------------------ */
 
-/* Enqueue a download. Returns 202 immediately; the pool admits + downloads it
-   across N connections. De-dupes by title_id; resumes a paused job.
-   When patch_url is a manifest JSON and delta_url is set, downloads the DP.pkg
-   bootstrap directly (44 MB) instead of the multi-piece 66 GB split package. */
+/* 202 right away, the pool does the rest. a paused job resumes */
 static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
             patchdl_source_t src, const char *patch_url, const char *delta_url,
@@ -2615,8 +2426,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     if (!patch_url[0])
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"no_compatible_patch\"}");
-    /* A download rewrites the package in place: never while the console is
-       installing from it, and not for a version that is already installed. */
+    /* the pkg gets rewritten in place, not while an install reads it */
     if (install_reading(title_id))
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"install_running\"}");
@@ -2624,16 +2434,13 @@ do_download(struct MHD_Connection *conn, const char *title_id,
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"already_installed\"}");
 
-    /* Snapshot the g_mutex-guarded flag before taking the pool lock (lock order
-       is g_mutex-before-g_pool, so we cannot read it while holding g_pool.mtx). */
+    /* lock order is g_mutex before g_pool, so read the flag first */
     pthread_mutex_lock(&g_mutex);
     verify = g_cfg.verify_downloads;
     pthread_mutex_unlock(&g_mutex);
 
     pthread_mutex_lock(&g_pool.mtx);
-    /* Finished and failed jobs stay listed (one per title, so bounded by
-       the library) but don't take a queue slot: "Update all" on a big
-       library must not hit queue_full. */
+    /* done/failed jobs take no slot, or "Update all" hits queue_full */
     for (job = g_pool.jobs; job; job = job->next) {
         if (job->state != JOB_DONE && job->state != JOB_FAILED) count++;
         if (!strcmp(job->title_id, title_id)) existing = job;
@@ -2641,7 +2448,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     if (existing) {
         job_state_t st = existing->state;
         if (st == JOB_PAUSING && existing->in_admit) {
-            /* paused while its manifest was still loading: take the pause back */
+            /* paused while the manifest was loading: take the pause back */
             existing->state = JOB_ADMITTING;
             existing->abort = 0;
             pthread_mutex_unlock(&g_pool.mtx);
@@ -2654,24 +2461,24 @@ do_download(struct MHD_Connection *conn, const char *title_id,
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":true,\"queued\":true,\"already\":true}");
         }
-        if (st == JOB_CANCELLING) {        /* mid-cancel teardown — don't touch it */
+        if (st == JOB_CANCELLING) {        /* mid-cancel, hands off */
             pthread_mutex_unlock(&g_pool.mtx);
             return queue_json(conn, MHD_HTTP_CONFLICT,
                               "{\"ok\":false,\"reason\":\"cancelling\"}");
         }
-        if (st == JOB_PAUSED) {            /* resume */
+        if (st == JOB_PAUSED) {
             existing->state = JOB_QUEUED;
             pthread_cond_broadcast(&g_pool.cv);
             pthread_mutex_unlock(&g_pool.mtx);
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":true,\"queued\":true,\"resumed\":true}");
         }
-        if (st == JOB_DONE) {              /* already downloaded */
+        if (st == JOB_DONE) {
             pthread_mutex_unlock(&g_pool.mtx);
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":true,\"downloaded\":true,\"already\":true}");
         }
-        /* FAILED: drop it and re-enqueue fresh below (it took no slot) */
+        /* FAILED: drop it, re-enqueue below (it took no slot) */
         free_job_locked(existing);
     }
     if (count >= POOL_MAX_JOBS) {
@@ -2692,9 +2499,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     {
         snprintf(job->manifest_url, sizeof job->manifest_url, "%s", patch_url);
         title_dir(title_id, job->dir, sizeof job->dir);
-        /* create it now: from here on every lookup (sidecar, package,
-           install) finds this folder, even if the drive in Settings
-           changes before the download starts */
+        /* create it now so later lookups find it even if the drive changes */
         make_title_dir(job->dir);
         title_pkg_path(title_id, patch_url, job->dest, sizeof job->dest);
         job->is_manifest = url_is_manifest(patch_url);
@@ -2702,7 +2507,6 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     job->verify = verify;
     job->state = JOB_QUEUED;
     job->fd = -1;
-    /* append to keep FIFO queue order */
     {
         dl_job_t **pp = &g_pool.jobs;
         while (*pp) pp = &(*pp)->next;
@@ -2714,8 +2518,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     return queue_json(conn, MHD_HTTP_ACCEPTED, "{\"ok\":true,\"queued\":true}");
 }
 
-/* Pause: keep the partial (resumable). The active job aborts; a queued job is
-   just parked. */
+/* keep the partial. the active job aborts, a queued one just parks */
 static enum MHD_Result
 do_pause(struct MHD_Connection *conn, const char *title_id) {
     dl_job_t *job;
@@ -2725,8 +2528,7 @@ do_pause(struct MHD_Connection *conn, const char *title_id) {
     for (job = g_pool.jobs; job; job = job->next) {
         if (strcmp(job->title_id, title_id)) continue;
         if (job->state == JOB_ACTIVE || job->state == JOB_ADMITTING) {
-            /* ADMITTING: admit_next sees JOB_PAUSING on relock and parks it
-               PAUSED, keeping the partial — no transfer is started. */
+            /* admit_next sees PAUSING on relock and parks it, nothing starts */
             job->state = JOB_PAUSING;
             job->abort = 1;
             pthread_cond_broadcast(&g_pool.cv);
@@ -2744,9 +2546,7 @@ do_pause(struct MHD_Connection *conn, const char *title_id) {
     return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"paused\":true}");
 }
 
-/* Cancel: stop AND delete. The active job's workers abort and a worker finalizes
-   the delete once in-flight pieces drain; an idle/queued/paused/done job is
-   deleted directly; a leftover on-disk partial (no job) is removed too. */
+/* stop and delete. the last worker finalizes once in-flight pieces drain */
 static void cancel_title(const char *title_id);
 
 static enum MHD_Result
@@ -2758,8 +2558,7 @@ do_cancel(struct MHD_Connection *conn, const char *title_id) {
     return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"cancelled\":true}");
 }
 
-/* Stop the title's download job if any and delete its whole folder (package,
-   sidecar, .crc, pasted link). The caller has made sure no install reads it. */
+/* stop the job and delete the whole folder, no install may be reading it */
 static void
 cancel_title(const char *title_id) {
     dl_job_t *job;
@@ -2770,12 +2569,10 @@ cancel_title(const char *title_id) {
         if (strcmp(job->title_id, title_id)) continue;
         had_job = 1;
         if (job->state == JOB_CANCELLING) {
-            /* already on its way out; its finalizer runs once */
+            /* already on its way out */
         } else if (job->in_admit) {
-            /* being admitted (lock dropped for manifest I/O), possibly
-               flagged PAUSING meanwhile: only flag it. admit_next holds a
-               raw pointer to this job and is the sole finalizer once it
-               relocks — freeing here would be a UAF. */
+            /* lock dropped for manifest I/O, admit_next holds a raw pointer and
+               finalizes on relock. freeing here would be a use-after-free */
             job->state = JOB_CANCELLING;
             job->seq++;
             job->abort = 1;
@@ -2787,7 +2584,7 @@ cancel_title(const char *title_id) {
             pthread_cond_broadcast(&g_pool.cv);
             if (job->inflight == 0) finalize_cancel_locked(job);
         } else {
-            /* QUEUED / PAUSED / DONE / FAILED: no in-flight pieces */
+            /* no in-flight pieces */
             finalize_cancel_locked(job);
         }
         break;
@@ -2795,7 +2592,7 @@ cancel_title(const char *title_id) {
     pthread_mutex_unlock(&g_pool.mtx);
 
     if (!had_job) {
-        /* a partial left on disk from a previous boot has no live job */
+        /* leftover partial from a previous boot, no live job */
         remove_title_dir(title_id);
         set_title_resumable(title_id, 0, 0);
         set_title_downloaded(title_id, 0);
@@ -2803,10 +2600,7 @@ cancel_title(const char *title_id) {
     clear_manual_source(title_id);
 }
 
-/* The package is whole: no unfinished job for the title, and a sidecar that
-   has every piece. A package without a sidecar (copied in by hand, or
-   finished by an older PatchDL) is unproven: a download run hashes it
-   against the manifest first (verify_existing). */
+/* whole = no unfinished job and a full sidecar. no sidecar = unproven */
 static int
 download_complete(const char *title_id) {
     char      path[320], buf[8192];
@@ -2829,16 +2623,12 @@ download_complete(const char *title_id) {
     n = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
     buf[n] = '\0';
-    /* A single-URL download has no size up front (total 0): only its live
-       finished job vouches for it. */
+    /* single-URL download has no size (total 0), only its DONE job vouches */
     if (json_get_ll(buf, "total", 0) <= 0) return done_job;
     return json_get_ll(buf, "done_bytes", 0) >= json_get_ll(buf, "total", 0);
 }
 
-/* Everything PatchDL keeps in <drive>/patchdl on every drive, one entry per
-   title folder,
-   so the UI can show what takes space and delete it, including folders of
-   games that are no longer installed. */
+/* every title folder on every drive, gone games included */
 static char *
 build_storage_json(void) {
     jbuf_t         j = {0};
@@ -2885,8 +2675,7 @@ build_storage_json(void) {
             }
             sum += bytes;
 
-            /* The package's version: the sidecar knows it for downloads since
-               this version, the pasted link for Prospero downloads. */
+            /* version from the sidecar, or from the pasted link for Prospero */
             title_state_path(de->d_name, path, sizeof path);
             if ((vf = fopen(path, "r"))) {
                 size_t n = fread(buf, 1, sizeof buf - 1, vf);
@@ -2909,9 +2698,8 @@ build_storage_json(void) {
                 if (!strcmp(g_titles[i].title_id, de->d_name)) {
                     snprintf(name, sizeof name, "%s", g_titles[i].name);
                     snprintf(inst, sizeof inst, "%s", g_titles[i].installed_version);
-                    /* No recorded version (downloaded before sidecars kept
-                       it): the file is named after the manifest, so a name
-                       equal to Sony's current patch gives its version. */
+                    /* older download without version: a name matching Sony's
+                       current patch gives it */
                     if (!ver[0] && pkgname[0] && g_titles[i].patch_url[0]) {
                         char expect[320];
                         title_pkg_path(de->d_name, g_titles[i].patch_url,
@@ -2955,8 +2743,7 @@ build_storage_json(void) {
     return j.buf;
 }
 
-/* GET /api/drives: the drives packages can go to, with free and total
-   space, and which one new downloads use. */
+/* GET /api/drives: free/total per drive and the one in use */
 static char *
 build_drives_json(void) {
     char  drives[MAX_DRIVES][32], root[64];
@@ -2982,7 +2769,6 @@ build_drives_json(void) {
     return j.buf;
 }
 
-/* Host part of a URL into out ("" if none). */
 static void
 url_host_of(const char *url, char *out, size_t sz) {
     const char *p = strstr(url, "://");
@@ -2994,10 +2780,7 @@ url_host_of(const char *url, char *out, size_t sz) {
     if (n < sz) { memcpy(out, p, n); out[n] = '\0'; }
 }
 
-/* GET /api/versions?title=<id>: every patch version Prospero Patches (PS5)
-   or Orbis Patches (PS4) lists for the game, each marked whether it can be
-   picked here: newer than the installed version and, on PS5, runnable on
-   this firmware. Older versions are not offered (no downgrades). */
+/* GET /api/versions?title=<id> via Prospero/Orbis Patches, no downgrades */
 static enum MHD_Result
 queue_versions(struct MHD_Connection *conn, const char *tid) {
     patchdl_patch_version_t *list;
@@ -3048,9 +2831,7 @@ queue_versions(struct MHD_Connection *conn, const char *tid) {
     return queue_json_owned(conn, MHD_HTTP_OK, j.buf);
 }
 
-/* A fresh DNS answer for host as "ip", "ips", "dns" (where it came from)
-   and "dns_trail" (what failed before), so a report tells a blocked DNS
-   apart from a blocked connection. */
+/* fresh DNS answer with source and trail, blocked DNS vs blocked connect */
 static void
 append_dns(jbuf_t *j, const char *host) {
     patchdl_dns_answer_t a;
@@ -3071,9 +2852,8 @@ append_dns(jbuf_t *j, const char *host) {
     jbuf_append(j, ",\"dns_trail\":"); jbuf_append_str(j, a.trail);
 }
 
-/* GET /api/netcheck?title=<id>: walk one title's update chain the way a
-   download does (update list, then the package manifest) and report each
-   step with PatchDL's own DNS answer, so a report shows where it breaks. */
+/* GET /api/netcheck?title=<id>: walk update list and manifest like a
+   download, to see where it breaks */
 static enum MHD_Result
 queue_netcheck_title(struct MHD_Connection *conn, const char *tid) {
     char              vurl[512] = "", host[128], step[24], tid9[16];
@@ -3088,7 +2868,7 @@ queue_netcheck_title(struct MHD_Connection *conn, const char *tid) {
     patchdl_manifest_t mf;
     jbuf_t            j = {0};
 
-    /* Same ids as the title actions; Sony's URLs use the 9-character id. */
+    /* Sony's URLs use the 9-char id */
     if (!path_segment_safe(tid) || strlen(tid) < 9 || strlen(tid) >= 32)
         return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
     snprintf(tid9, sizeof tid9, "%.9s", tid);
@@ -3112,8 +2892,7 @@ queue_netcheck_title(struct MHD_Connection *conn, const char *tid) {
                  vrc == 0 ? "true" : "false", curl_rc, http);
     jbuf_append_str(&j, step);
     jbuf_append(&j, ",\"latest\":"); jbuf_append_str(&j, info.latest_version);
-    /* The package a download would use: a pasted Prospero link wins over
-       Sony's current list, exactly as for the download itself. */
+    /* pasted Prospero link wins over Sony's list, same as the download */
     if (!get_title_action_info(tid, &src, murl, sizeof murl, durl, sizeof durl,
                                ptid, sizeof ptid, pstid, sizeof pstid,
                                cid, sizeof cid, nm, sizeof nm, ver, sizeof ver, &en) ||
@@ -3130,7 +2909,7 @@ queue_netcheck_title(struct MHD_Connection *conn, const char *tid) {
         pieces = mf.count;
         patchdl_manifest_free(&mf);
     } else if (murl[0]) {
-        /* a single package without a piece list: nothing to fetch here */
+        /* single pkg without a piece list, nothing to fetch */
         mrc = 0;
         pieces = 1;
         snprintf(step, sizeof step, "direct");
@@ -3156,8 +2935,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
                           "{\"ok\":false,\"reason\":\"title_disabled\"}");
 
-    /* Source policy: only genuine installs may be patched in place.
-       Shadowmounts are download-only; unknown and fake packages are blocked. */
+    /* only real installs get patched, shadowmounts are download-only */
     if (src != PATCHDL_SOURCE_OFFICIAL && src != PATCHDL_SOURCE_EXTERNAL)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
                           "{\"ok\":false,\"reason\":\"install_not_allowed_for_source\"}");
@@ -3180,9 +2958,9 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                           : "{\"ok\":false,\"reason\":\"download_incomplete\"}");
     }
 
-    /* The console writes the update next to the game and needs about the
-       package's size free there; with less, its installer reads the header
-       and quietly stops. Ask before starting (force = the user said go). */
+    /* the update lands next to the game and needs about the pkg size free
+       there, or the installer reads the header and quietly gives up. no error,
+       of course. force = user said go anyway */
     if (!force) {
         char        gdir[256] = "";
         struct stat pst;
@@ -3206,7 +2984,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         }
     }
 
-    /* GUARD (app layer): the version.xml target title id must match the game. */
+    /* version.xml target title id must match the game */
     if (patch_title_id[0] && strncmp(patch_title_id, title_id, 9) != 0) {
         snprintf(resp, sizeof(resp),
                  "{\"ok\":false,\"reason\":\"patch_title_mismatch\","
@@ -3215,17 +2993,12 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
     }
 
-    /* Shared-master packages need no special case: the package assembled from
-       the manifest carries the installed game's content id. The installer
-       streams it from our /api/pkg (InstallByPackage); AppInstallPkg is not
-       used because it only writes metadata without installing content. */
+    /* shared-master pkgs carry the game's content id, nothing special.
+       AppInstallPkg only writes metadata, so InstallByPackage via /api/pkg */
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    /* One install per title: check and claim in one step, so a second
-       request (another browser tab with "install after download", a double
-       click) can't start the same install again. The claim holds until the
-       post-install check has run; then version_installed() takes over. A
-       claim whose install stalled or never got read may be retried. */
+    /* check and claim in one go, so a second tab or a double click can't
+       start it twice */
     {
         struct stat pst;
         const char *base = strrchr(dest, '/');
@@ -3241,7 +3014,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
             else if (st->verified > 0 && !strcmp(st->version, version))
                 reason = "already_installed";
         } else {
-            /* a free entry, else the oldest one that is over */
+            /* a free entry, else the oldest finished one */
             for (int i = 0; i < MAX_STREAMS && !st; i++)
                 if (!g_streams[i].title_id[0]) st = &g_streams[i];
             for (int i = 0; i < MAX_STREAMS; i++) {
@@ -3275,7 +3048,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         st->claiming = 0;
         st->started  = st->last = time(NULL);
     } else {
-        memset(st, 0, sizeof *st);   /* nothing started: release */
+        memset(st, 0, sizeof *st);   /* nothing started, release */
     }
     pthread_mutex_unlock(&g_mutex);
     snprintf(resp, sizeof(resp),
@@ -3285,13 +3058,8 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                             strdup(resp));
 }
 
-/* Turn a link copied from Prospero's "Additional Files" into the URL of
-   Sony's package manifest. Sony keeps the manifest ("<name>.json") in the same
-   folder as the package's "<name>_sc.pkg" piece and "<name>.crc" file, and the
-   manifest lists every piece with its offset and SHA-256, so the download then
-   runs exactly like an official one. Piece links ("<name>_<n>.pkg") live in a
-   different folder and can't lead to the manifest. Returns NULL on success,
-   else a reason code for the UI. */
+/* Prospero link to Sony's manifest (<name>.json next to <name>_sc.pkg
+   and .crc). NULL on success, else a reason for the UI */
 static const char *
 manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
     static const char *const ends[] = { "_sc.pkg", ".crc", ".json", NULL };
@@ -3300,8 +3068,8 @@ manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
     size_t      n = strlen(in);
     int         ps4_piece = 0;
 
-    /* The URL ends up unescaped in JSON sidecars and responses, and dot
-       segments could walk the path into another title's folder. */
+    /* the URL lands unescaped in JSON, and dot segments could walk into
+       another title's folder */
     for (p = in; *p; p++)
         if (!isalnum((unsigned char)*p) && !strchr("-._~:/", *p))
             return "url_invalid";
@@ -3315,9 +3083,8 @@ manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
         size_t el = strlen(ends[i]);
         if (n > el && !strcmp(in + n - el, ends[i])) { stem_end = in + n - el; break; }
     }
-    /* PS4: Orbis Patches lists the pieces, which sit in the same gs2 folder
-       as the manifest "<name>.json": "<name>_0.pkg", "_1.pkg", ... for a
-       split package, or just "<name>.pkg" when it is a single piece. */
+    /* PS4: Orbis lists the pieces (<name>_0.pkg ... or <name>.pkg), same
+       gs2 folder as <name>.json */
     if (!stem_end && !strncmp(rest, "gs2.ww.prod.dl.playstation.net/", 31) &&
         n > 5 && !strcmp(in + n - 4, ".pkg")) {
         const char *d = in + n - 4;
@@ -3329,15 +3096,15 @@ manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
     base = strrchr(in, '/') + 1;    /* the scheme guarantees a '/' */
     if (stem_end <= base)           return "not_an_sc_link";
 
-    /* Sony keeps a title's files under ".../<TID>_00/..." and names them
-       "<publisher>-<TID>_00-<label>..."; both must name this title. */
+    /* Sony's paths look like .../<TID>_00/<publisher>-<TID>_00-<label>,
+       both parts must name this title */
     snprintf(tag, sizeof tag, "/%.9s_", tid);
     if (!strstr(in, tag))           return "url_title_mismatch";
     tag[0] = '-';
     if (!strstr(base, tag))         return "url_title_mismatch";
 
-    /* PS5 manifests are fetched over https with the pinned Sony root; PS4
-       manifests only exist over plain http on gs2 (see PLAIN_HTTP_HOST). */
+    /* PS5 manifests over https with the pinned Sony root, PS4 ones only
+       exist over plain http on gs2 (PLAIN_HTTP_HOST) */
     if (sizeof("https://") - 1 + (size_t)(stem_end - rest) + sizeof(".json") > sz)
         return "url_too_long";
     snprintf(canon, sz, "%s%.*s.json", ps4_piece ? "http://" : "https://",
@@ -3345,10 +3112,8 @@ manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
     return NULL;
 }
 
-/* Prospero labels sizes in GiB ("71.7 GB"), about 0.1 above the piece sum.
-   Returns 1 when `found` bytes clearly don't match the size Prospero lists
-   for `ver`, i.e. the user most likely copied a link of another version.
-   Versions of (nearly) equal size can't be told apart this way. */
+/* Prospero shows GiB, about 0.1 above the piece sum. 1 if found is
+   clearly off, likely another version's link */
 static int
 size_mismatch(const char *tid, const char *ver, const char *given_size,
               long long found, char *label, size_t lsz) {
@@ -3356,7 +3121,7 @@ size_mismatch(const char *tid, const char *ver, const char *given_size,
     double v, unit_bytes, expect, diff, tol;
 
     if (given_size && given_size[0]) {
-        /* the size the version list showed for the version picked */
+        /* size the version list showed for the picked version */
         snprintf(lbl, sizeof lbl, "%s", given_size);
         snprintf(pver, sizeof pver, "%s", ver);
     } else {
@@ -3387,9 +3152,7 @@ size_mismatch(const char *tid, const char *ver, const char *given_size,
     return diff > tol;
 }
 
-/* Queue a patch from an SC/CRC link copied off Prospero Patches. The link must
-   point at this title's own folder on Sony's CDN, so a pasted URL can't put
-   another game's package on this one. */
+/* the link must be in this title's own CDN folder */
 static enum MHD_Result
 handle_download_url(struct MHD_Connection *conn, const char *body) {
     char             tid[32], in[768], ver[16], canon[512], state[320], resp[192];
@@ -3435,8 +3198,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
             "{\"ok\":false,\"reason\":\"source_not_supported\"}");
 
-    /* Different versions share the same file name, so never mix a new link
-       into an existing download or partial: the user cancels it first. */
+    /* versions share the file name, so cancel the old download first */
     pthread_mutex_lock(&g_pool.mtx);
     for (dl_job_t *j = g_pool.jobs; j; j = j->next)
         if (!strcmp(j->title_id, tid)) busy = 1;
@@ -3447,9 +3209,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
             "{\"ok\":false,\"reason\":\"download_exists\","
             "\"hint\":\"cancel the current download first\"}");
 
-    /* Load the manifest here rather than only at admit: a dead or wrong link
-       then fails with a reason the user sees right away, and the total can be
-       checked against the size Prospero lists for the version. */
+    /* fetch the manifest now so a dead link fails right away */
     if (patchdl_fetch_manifest(canon, &mf) != 0)
         return queue_json(conn, MHD_HTTP_BAD_GATEWAY,
             "{\"ok\":false,\"reason\":\"manifest_unavailable\"}");
@@ -3482,7 +3242,6 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
     return do_download(conn, tid, src, canon, "", tname, ver, en);
 }
 
-/* ---------- request routing -------------------------------------------- */
 
 static int
 parse_title_action(const char *url, char *title_id, size_t tid_sz,
@@ -3525,11 +3284,8 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
                            action, sizeof(action)))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
 
-    /* Defense in depth: title_id becomes part of /data/patchdl/<id> paths that
-       get created, written, and recursively deleted. Reject anything that
-       isn't a plain id BEFORE it can reach mkdir/unlink/rmdir, so no request
-       can ever escape the download directory (a title_id of ".." would resolve
-       the dir to /data). Real PS5 title ids only use [A-Za-z0-9_-.]. */
+    /* title_id ends up in paths that get created and recursively deleted.
+       ".." would point the dir at /data, so reject before any mkdir/unlink */
     if (!path_segment_safe(title_id))
         return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
 
@@ -3575,13 +3331,9 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
 }
 
-/* ---------- POST body accumulation ------------------------------------- */
 
-/* MHD delivers a POST body across several callback invocations. We stash a
-   growing buffer in con_cls and dispatch once the body is complete. The
-   largest legitimate body we accept is the config JSON or a small install
-   request — a few hundred bytes; 64 KiB leaves ample headroom while keeping
-   a misbehaving LAN client from forcing unbounded allocations. */
+/* the body comes in chunks, collected in con_cls. real ones are a few
+   hundred bytes */
 #define PATCHDL_POST_MAX_BYTES (64 * 1024)
 typedef struct {
     char  *data;
@@ -3608,9 +3360,7 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
     int  tile_just_enabled = 0;
 
     json_get_str(body, "default_policy", pol, sizeof(pol));
-    /* Only the two real values are accepted; anything else is silently
-       dropped so a malformed POST can't corrupt config.json or the JSON
-       we later round-trip out of /api/config. */
+    /* only the two real values, anything else is dropped */
     if (pol[0] && strcmp(pol, "allow") != 0 && strcmp(pol, "deny") != 0)
         pol[0] = '\0';
 
@@ -3648,10 +3398,7 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
     mc = g_cfg.max_connections;
     pthread_mutex_unlock(&g_mutex);
 
-    /* Apply the new connection count to the live pool — no restart. Raising it
-       wakes idle workers to pull pieces immediately; lowering it lets the extra
-       workers finish their current piece, then they park. (g_mutex released
-       first to keep the g_mutex-before-g_pool lock order.) */
+    /* apply to the live pool, g_mutex already released (lock order) */
     pthread_mutex_lock(&g_pool.mtx);
     g_pool.active_conns = mc;
     if (g_pool.active_conns < 1) g_pool.active_conns = 1;
@@ -3661,10 +3408,7 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
 
     save_config();
 
-    /* Trigger the tile install when the toggle just flipped on. Best-effort —
-       the config save is already committed; we don't want a tile error to
-       roll that back. Stat-guard inside the helper makes repeated calls a
-       no-op, so a save without flipping the toggle still costs nothing. */
+    /* best effort, the config is saved already. stat-guarded, repeats are free */
     if (tile_just_enabled) {
         char tile_msg[256];
         (void)patchdl_tile_install_if_needed(tile_msg, sizeof(tile_msg));
@@ -3692,7 +3436,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             return MHD_YES;
         }
 
-        if (*upload_data_size) {            /* a body chunk: append it */
+        if (*upload_data_size) {
             if (!pb->oversized &&
                 pb->len + *upload_data_size <= PATCHDL_POST_MAX_BYTES) {
                 char *n = realloc(pb->data, pb->len + *upload_data_size + 1);
@@ -3714,7 +3458,6 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         if (pb->oversized)
             return queue_json(conn, MHD_HTTP_CONTENT_TOO_LARGE,
                               "{\"ok\":false,\"reason\":\"body_too_large\"}");
-        /* final call: the full body (if any) is in pb->data */
         const char *body = pb->data ? pb->data : "";
         if (!strcmp(url, "/api/config"))
             return handle_config_post(conn, body);
@@ -3724,8 +3467,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         }
         if (!strncmp(url, "/api/titles/", 12))
             return handle_title_action(conn, url);
-        /* Delete a title's download folder, also for a game that is no
-           longer installed (title actions only know installed games). */
+        /* also for games no longer installed */
         if (!strncmp(url, "/api/storage/", 13)) {
             char        tid[32];
             const char *slash = strchr(url + 13, '/');
@@ -3737,9 +3479,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             if (!is_title_dir_name(tid))
                 return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
             {
-                /* The same title can have a folder on two drives (one
-                   downloaded while the other drive was unplugged). Delete
-                   the one the list showed, not just the first one found. */
+                /* a title can sit on two drives, delete the one the list showed */
                 char drive[32] = "", dir[160], cur[160];
                 json_get_str(body, "drive", drive, sizeof drive);
                 if (drive[0] && drive_name_ok(drive)) {
@@ -3916,9 +3656,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     }
 
     if (!strcmp(url, "/api/pkgdiag")) {
-        /* Snapshot under the lock — otherwise MHD would read g_pkg_diag_json
-           in-place (RESPMEM_PERSISTENT) while record_pkg_diag is mid-snprintf,
-           producing a torn read or a missing NUL terminator. */
+        /* copy under the lock, record_pkg_diag may be mid-write */
         char   snap[sizeof(g_pkg_diag_json)];
         jbuf_t j = {0};
         pthread_mutex_lock(&g_mutex);
@@ -3938,9 +3676,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, j.buf ? j.buf : strdup("{}"));
     }
 
-    /* Read-only diagnostic: re-fetch the patch manifest for a title (PatchDL can
-       bypass the DNS block) and dump each piece's offset/size/SHA-256 so the
-       assembled .pkg can be verified against Sony's own hashes. No install. */
+    /* read-only: manifest pieces with offset/size/SHA-256 */
     if (!strncmp(url, "/api/manifest/", 14)) {
         const char      *tid = url + 14;
         char             purl[768] = {0}, durl_[512] = {0};
@@ -3976,9 +3712,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
                                 j.buf ? j.buf : strdup("{}"));
     }
 
-    /* Read-only: SHA-256 every piece of the on-disk .pkg and compare to Sony's
-       manifest hashes — proves whether the assembled file is byte-correct. No
-       install. Hashing runs on-device (SSD), so no multi-GB transfer. */
+    /* read-only: hash every piece of the pkg on disk against the manifest */
     if (!strncmp(url, "/api/pkgverify/", 15)) {
         const char        *tid = url + 15;
         char               purl[768] = {0}, durl_[512] = {0};
@@ -4030,10 +3764,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, j.buf ? j.buf : strdup("{}"));
     }
 
-    /* Read-only: report the .pkg's embedded content id / title id vs the target
-       (installed app) ids. AppInstallPkg installs by the id inside the package,
-       so it lands on the game only when they match; where the CDN stores the
-       pieces (storage_title_id) doesn't matter. No install. */
+    /* read-only: pkg's own content/title id vs the installed app's */
     if (!strncmp(url, "/api/pkgmeta/", 13)) {
         const char      *tid = url + 13;
         char             purl[768] = {0}, durl_[512] = {0};
@@ -4060,8 +3791,8 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
                  "\"install_plan\":\"installbypackage\",\"msg\":\"%s\"}",
                  rc == 0 ? "true" : "false", ecid, etid, is_app ? "true" : "false",
                  cid, tid, psti,
-                 /* Sony's title-id query comes back empty for some packages;
-                    the content id carries the title id as well. */
+                 /* Sony's title-id query comes back empty for some
+                    pkgs, because why not. the content id has it too */
                  (rc == 0 && (!strncmp(etid, tid, 9) ||
                               (ecid[0] && !strcmp(ecid, cid)))) ? "true" : "false",
                  msg);
@@ -4082,8 +3813,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     if (!strcmp(url, "/api/netcheck")) {
         char diag[1024] = "{\"error\":\"no title with version_file_uri\"}";
         char uri[256] = "";
-        /* copy under the lock, probe without it: the probe blocks on the
-           network and must not stall the title list */
+        /* copy under the lock, probe without it (blocks on the network) */
         pthread_mutex_lock(&g_mutex);
         for (size_t i = 0; i < g_title_count; i++)
             if (g_titles[i].version_file_uri[0]) {
@@ -4092,7 +3822,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             }
         pthread_mutex_unlock(&g_mutex);
         if (uri[0]) patchdl_net_diag(uri, diag, sizeof(diag));
-        /* diag lives on this stack; MHD sends after we return */
+        /* diag is on the stack and MHD sends later, hence MUST_COPY */
         return queue_buffer(conn, MHD_HTTP_OK, "application/json",
                             diag, strlen(diag), MHD_RESPMEM_MUST_COPY);
     }
@@ -4103,9 +3833,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     return queue_asset(conn, url);
 }
 
-/* A title is resumable when its resume sidecar reports committed bytes between
-   0 and total (the .pkg is preallocated to the full size, so its on-disk size is
-   not progress — done_bytes from the bitmap sidecar is). Single-threaded. */
+/* progress from the sidecar, the pkg is preallocated */
 static void
 detect_resumable_partials(patchdl_title_t *arr, size_t cnt) {
     char   state[320], buf[16384];
@@ -4124,7 +3852,7 @@ detect_resumable_partials(patchdl_title_t *arr, size_t cnt) {
         total = json_get_ll(buf, "total", 0);
         done  = json_get_ll(buf, "done_bytes", 0);
         {
-            /* plus the synced parts of started pieces ("piece:bytes,...") */
+            /* plus synced parts of started pieces */
             char        have[SIDECAR_MAX_HAVE * 24];
             const char *p = have;
             json_get_str(buf, "have", have, sizeof have);
@@ -4146,7 +3874,6 @@ detect_resumable_partials(patchdl_title_t *arr, size_t cnt) {
     }
 }
 
-/* ---------- rescan ----------------------------------------------------- */
 
 static void
 start_verxml(void) {
@@ -4167,14 +3894,11 @@ stop_verxml(void) {
     g_verxml_started = 0;
 }
 
-/* Keep what PatchDL learned about a title across a rescan. The update check
-   only carries over while the installed version and content id are the same
-   and the rescan isn't an explicit refresh; otherwise it runs again. */
+/* update info only carries over with same version/content id, no refresh */
 static void
 carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck) {
-    /* A title that turned sideloaded (or back) keeps the switch its new
-       state starts with, so a sideloaded copy is never updated without the
-       user switching it on. */
+    /* turned sideloaded (or back): keep the new default, so no update
+       without the user's ok */
     if (dst->sideloaded == src->sideloaded)
         dst->enabled = src->enabled;
     dst->resumable     = src->resumable;
@@ -4182,8 +3906,7 @@ carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck)
     dst->downloaded    = src->downloaded;
     memcpy(dst->manual_url, src->manual_url, sizeof dst->manual_url);
     memcpy(dst->manual_version, src->manual_version, sizeof dst->manual_version);
-    /* An explicit refresh asks Sony again, so a patch released since the
-       last check shows up. */
+    /* an explicit refresh asks Sony again for new patches */
     if (recheck || strcmp(dst->installed_version, src->installed_version) ||
         strcmp(dst->content_id, src->content_id))
         return;
@@ -4203,8 +3926,7 @@ carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck)
     dst->prospero_done = src->prospero_done;
 }
 
-/* Re-read the installed titles and swap the new list in. Only the scan
-   thread calls this. */
+/* only the scan thread calls this */
 static int
 rescan_titles(int recheck) {
     patchdl_title_t *arr, *old;
@@ -4220,7 +3942,7 @@ rescan_titles(int recheck) {
     load_manual_sources(arr, cnt);
     detect_resumable_partials(arr, cnt);
 
-    /* The version.xml thread holds pointers into g_titles. */
+    /* the version.xml thread holds pointers into g_titles */
     g_rescan_step = "stop verxml";
     stop_verxml();
     t2 = mono_ms();
@@ -4247,11 +3969,8 @@ rescan_titles(int recheck) {
 
 #define POST_INSTALL_GIVE_UP (15 * 60)
 
-/* After an install went quiet: did it really install this package? Both the
-   installed version (now at least the package's) and the title's app.json
-   (written by the installer, naming our package file and its size) must say
-   so. Only then, and only with "Delete PKG after install" on, the download
-   folder goes. */
+/* did the install really take this pkg? version and app.json (the file
+   and size) must both say so */
 static void
 check_one_install(int idx) {
     char              tid[16], ver[16], file[160], size_key[48];
@@ -4276,27 +3995,27 @@ check_one_install(int idx) {
     del   = g_cfg.delete_pkg_after_install;
     pthread_mutex_unlock(&g_mutex);
 
-    /* app.json lists every piece URL; give it room. */
+    /* app.json lists every piece URL, give it room */
     idle = (long long)(time(NULL) - last);
     snprintf(size_key, sizeof size_key, "\"originalFileSize\":%lld", total);
     aj = malloc(256 * 1024);
-    /* A PS5 update replaces the game's app.pkg (app.json); a PS4 patch
-       lands next to it under /user/patch/<id>/ (patch.json). */
+    /* a PS5 update replaces app.pkg (app.json), a PS4 patch lands in
+       /user/patch/<id>/ (patch.json) */
     ok = aj && version_installed(tid, ver) && file[0] &&
          (strncmp(tid, "CUSA", 4)
               ? patchdl_scan_read_app_file(tid, "app.json", aj, 256 * 1024)
               : patchdl_scan_read_patch_file(tid, "patch.json", aj, 256 * 1024)) == 0 &&
          strstr(aj, file) && strstr(aj, size_key);
     free(aj);
-    /* install_reading() would say busy: this install is the one being
-       checked, and it has finished reading and gone quiet. */
+    /* install_reading() would say busy, but this is the install being
+       checked and it's done */
     if (ok && del) {
         cancel_title(tid);
         deleted = 1;
     }
 
-    /* The console may register the new version a while after the last
-       request; keep checking for a quarter of an hour before giving up. */
+    /* the console may register the version a while after the last
+       request, so keep trying for 15 minutes */
     if (!ok && idle < POST_INSTALL_GIVE_UP)
         return;
     pthread_mutex_lock(&g_mutex);
@@ -4314,11 +4033,8 @@ post_install_check(void) {
         check_one_install(i);
 }
 
-/* Watch the title directories and Sony's app.db. A new game copying from
-   disc changes them for minutes, so rescan only once a change has held
-   still for one poll. An install from PatchDL touches neither right away,
-   so also rescan once the console has stopped fetching a package for a
-   minute. /api/rescan skips the wait. */
+/* rescan when the title dirs or app.db held still for a poll (disc copies
+   take minutes), or a minute after the last pkg fetch */
 static void *
 scan_watch_thread(void *arg) {
     unsigned long long scanned = patchdl_scan_signature(), seen = scanned;
@@ -4343,16 +4059,15 @@ scan_watch_thread(void *arg) {
             int recheck = g_scan_now;   /* the Refresh button */
             g_scan_now = 0;
             if (install_done) fetched_seen = fetched;
-            /* a failed scan (e.g. app.db copied mid-write) keeps the old
-               signature, so the next poll tries again */
+            /* a failed scan (app.db caught mid-write, happens more than you'd
+               think) keeps the old signature, so the next poll retries */
             if (rescan_titles(recheck) == 0) scanned = now;
             if (install_done) {
                 post_install_check();
                 next_check = time(NULL) + INSTALL_QUIET_SECS;
             }
         } else if (next_check && time(NULL) >= next_check) {
-            /* the check didn't pass yet: rescan (the version may have been
-               registered since) and try again each minute until it gives up */
+            /* not checked yet: rescan and retry each minute until it gives up */
             int pending;
             pthread_mutex_lock(&g_mutex);
             pending = 0;
@@ -4374,7 +4089,6 @@ scan_watch_thread(void *arg) {
     return NULL;
 }
 
-/* ---------- lifecycle -------------------------------------------------- */
 
 static unsigned short web_port;
 
@@ -4384,12 +4098,7 @@ start_web_daemon(unsigned short port) {
         MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
         port, NULL, NULL, &on_request, NULL,
         MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
-        /* DoS guards + RAM caps: the PS5 process budget is a few hundred MB
-           and the default pthread stack on this libc is multiple MB. We're
-           a single-user UI — 8 concurrent connections is plenty for the
-           SSE poll + a couple of AJAX, and 256 KB per worker is more than
-           enough for our handlers (largest stack use is a 16 KB sidecar
-           buffer in seed_from_sidecar). */
+        /* RAM caps, the process budget is a few hundred MB. single-user UI */
         MHD_OPTION_CONNECTION_LIMIT,        (unsigned int)8,
         MHD_OPTION_PER_IP_CONNECTION_LIMIT, (unsigned int)8,
         MHD_OPTION_CONNECTION_TIMEOUT,      (unsigned int)30,
@@ -4401,60 +4110,49 @@ int
 patchdl_websrv_start(unsigned short port) {
     if (web_daemon) return 0;
 
-    /* Collect real FW version and installed titles synchronously.
-       The web UI is reachable only after this completes. */
+    /* fw and titles synchronously, the UI only comes up after this */
     patchdl_fw_get(&g_fw);
 
     if (patchdl_scan(&g_titles, &g_title_count))
         g_title_count = 0;
 
-    /* Default per-title policy (unknown sources off), then overlay anything the
-       user previously saved to /data/patchdl/config.json. */
+    /* default: unknown sources off, then the saved config on top */
     for (size_t i = 0; i < g_title_count; i++)
         g_titles[i].enabled = (g_titles[i].source_type != PATCHDL_SOURCE_UNKNOWN) &&
                               !g_titles[i].sideloaded;
     load_config();
-    /* A saved config must not switch a fake package back on. */
+    /* a saved config can't switch a fake back on */
     for (size_t i = 0; i < g_title_count; i++)
         if (g_titles[i].source_type == PATCHDL_SOURCE_FAKE)
             g_titles[i].enabled = 0;
 
-    /* If the user opted into a home-screen tile, refresh it now. The helper
-       is stat-guarded — when nothing changed on disk it's a no-op, so the
-       cost on subsequent startups is two file reads. Best-effort: never
-       block startup on a tile install failure. */
+    /* home tile, stat-guarded. a failure never blocks startup */
     if (g_cfg.home_shortcut) {
         char tile_msg[256];
         (void)patchdl_tile_install_if_needed(tile_msg, sizeof(tile_msg));
     }
 
-    /* Flag titles that have a partial download on disk so the UI can offer
-       Resume after a reboot. */
+    /* partials on disk get Resume after a reboot */
     load_manual_sources(g_titles, g_title_count);
     detect_resumable_partials(g_titles, g_title_count);
 
-    /* Build the diagnostic dump now, while single-threaded — the root-vnode
-       swap it performs is unsafe once MHD worker threads are running. */
+    /* single-threaded only, the root vnode swap inside is unsafe once
+       MHD threads run */
     g_debug_json = patchdl_scan_debug_json();
 
-    /* curl's global/OpenSSL init MUST run once, single-threaded, before the
-       download workers race their first curl_easy_init. */
+    /* curl/OpenSSL global init once, before the workers race their first
+       curl_easy_init */
     patchdl_net_global_init();
 
-    /* Spawn the full set of workers BEFORE the web server accepts work, then
-       cap how many are *active* with g_pool.active_conns. Spawning all of them
-       up front lets the connection count be raised live (up to POOL_MAX_CONN)
-       without creating threads at runtime; idle workers just wait on the cv.
-       active_conns/n_workers are set before the first pthread_create so every
-       worker reads a valid limit from its gate (no startup data race). */
+    /* spawn all up front and cap with active_conns, so the count can go up
+       live. limits set before the first pthread_create */
     g_pool.n_workers   = POOL_MAX_CONN;
     g_pool.active_conns = g_cfg.max_connections;
     if (g_pool.active_conns < 1) g_pool.active_conns = 1;
     if (g_pool.active_conns > POOL_MAX_CONN) g_pool.active_conns = POOL_MAX_CONN;
     g_pool.stopping = 0;
     {
-        /* An explicit stack: the default one on the console proved too small
-           once (rescan), and curl, OpenSSL and the resolver run here. */
+        /* explicit stack, the default was too small once */
         pthread_attr_t wattr;
         int spawned = 0;
         pthread_attr_init(&wattr);
@@ -4492,24 +4190,20 @@ patchdl_websrv_start(unsigned short port) {
         return -1;
     }
 
-    /* Lock further patchdl_scan / patchdl_scan_debug_json calls — both do a
-       process-wide vnode swap that is only safe before MHD worker threads
-       come up. After this point the only scan happens internally above. */
+    /* no more root vnode swaps from here, they're process-wide and would race
+       the MHD threads. later scans go through the kept root fd */
     patchdl_scan_lock();
 
-    /* Start background verxml fetch — joinable so patchdl_websrv_stop can wait
-       for it before freeing g_titles (it reads g_titles across blocking queries). */
     start_verxml();
 
-    /* Load the install backend now, so the first Install click doesn't find
-       it still starting. Runs in its own thread. */
+    /* load the install backend early so the first Install click finds it ready */
     {
         char m[128];
         (void)patchdl_install_backend_check(m, sizeof m);
     }
 
-    /* The scan keeps several 8 KB buffers on its stack; the default thread
-       stack here is too small for that (a read into it failed with EFAULT). */
+    /* the scan keeps a few 8 KB buffers on its stack and the default stack
+       disagrees (EFAULT on a read, that was a fun one) */
     g_scan_stop = 0;
     {
         pthread_attr_t attr;
@@ -4523,9 +4217,8 @@ patchdl_websrv_start(unsigned short port) {
     return 0;
 }
 
-/* Can a client still connect to the web UI? A loopback connect that is
-   refused means the listening socket is gone; a timeout or any other error
-   says nothing about it. */
+/* only a refused loopback connect means the listener is gone, a timeout
+   says nothing */
 static int
 listener_refused(unsigned short port) {
     struct sockaddr_in sa;
@@ -4556,9 +4249,8 @@ listener_refused(unsigned short port) {
     return refused;
 }
 
-/* The console drops listening sockets when the network changes (Wi-Fi off
-   and on, cable pulled). The process keeps running but nobody can connect
-   any more, so start the web server again. */
+/* the console drops listening sockets on network changes and the process
+   lives on happily with nobody able to connect. restart it */
 int
 patchdl_websrv_watch(void) {
     struct MHD_Daemon *d = NULL;
@@ -4581,17 +4273,15 @@ patchdl_websrv_stop(void) {
         MHD_stop_daemon(web_daemon);
         web_daemon = NULL;
     }
-    /* The rescan thread swaps g_titles and restarts the version.xml thread,
-       so it goes first. Then stop the version.xml thread before anything
-       frees g_titles — it dereferences g_titles across blocking queries. */
+    /* rescan thread first (it restarts version.xml), then version.xml before
+       g_titles goes */
     if (g_scan_started) {
         g_scan_stop = 1;
         pthread_join(g_scan_tid, NULL);
         g_scan_started = 0;
     }
     stop_verxml();
-    /* Stop the pool: signal, join every worker (each finishes its current piece
-       write then exits), THEN tear curl + the title list down. */
+    /* workers finish their current piece write, then exit */
     pthread_mutex_lock(&g_pool.mtx);
     g_pool.stopping = 1;
     pthread_cond_broadcast(&g_pool.cv);
@@ -4599,9 +4289,7 @@ patchdl_websrv_stop(void) {
     for (int s = 0; s < g_pool.n_workers; s++)
         pthread_join(g_pool.workers[s], NULL);
     g_pool.n_workers = 0;
-    /* Free every job still in the pool list. Workers have joined so nobody
-       else touches the list. free_job_locked unlinks + frees mf.pieces[i].url,
-       mf.pieces, ps, bitmap, and closes the fd. */
+    /* workers are joined, nobody else touches the list */
     pthread_mutex_lock(&g_pool.mtx);
     while (g_pool.jobs) free_job_locked(g_pool.jobs);
     pthread_mutex_unlock(&g_pool.mtx);

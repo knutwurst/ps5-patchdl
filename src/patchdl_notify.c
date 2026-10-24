@@ -18,7 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
-/* Standard PS5/PS4 on-screen notification (same layout ftpsrv uses). */
+/* same layout as ftpsrv */
 typedef struct {
     char useless1[45];
     char message[3075];
@@ -41,7 +41,6 @@ notify(const char *fmt, ...) {
     puts(req.message);
 }
 
-/* First non-loopback IPv4 address of the console. */
 static void
 local_ip(char *out, size_t n) {
     struct ifaddrs *ifa = NULL, *p;

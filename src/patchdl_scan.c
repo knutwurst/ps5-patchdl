@@ -39,14 +39,12 @@ static const char *SCAN_DIRS[] = {
     NULL,
 };
 
-/* The first scan runs single-threaded with the process root swapped to the
-   system root and keeps a handle to that root. Later scans (other threads are
-   running, so the root must not move) change only the working directory to
-   it and drop the leading '/' of every path, see sys_path. Nothing else in
-   PatchDL opens relative paths. */
+/* first scan: single-threaded, root swapped, keeps an fd to the system root.
+   later scans (threads running, root stays put) only fchdir there and drop
+   the leading '/', see sys_path. nothing else uses relative paths */
 static int g_sysroot_fd = -1;
 static int g_rel_paths;
-/* Step the running scan is in, for diagnosing slow rescans. */
+/* for slow rescans */
 static const char *volatile g_scan_step = "idle";
 
 const char *
@@ -58,8 +56,6 @@ static const char *
 sys_path(const char *p) {
     return (g_rel_paths && p[0] == '/') ? p + 1 : p;
 }
-
-/* ---------- param.json -------------------------------------------------- */
 
 static int
 json_str(const char *json, const char *key, char *out, size_t out_sz) {
@@ -84,8 +80,7 @@ json_str(const char *json, const char *key, char *out, size_t out_sz) {
     return 0;
 }
 
-/* Extract the title name for the default language out of the nested
-   localizedParameters block. PS5 param.json has no flat titleName key. */
+/* PS5 param.json has no flat titleName, dig in localizedParameters */
 static void
 json_title_name(const char *json, char *out, size_t out_sz) {
     char        lang[16] = {0};
@@ -104,7 +99,7 @@ json_title_name(const char *json, char *out, size_t out_sz) {
         }
     }
 
-    /* Fallback: first titleName anywhere in the file */
+    /* else the first one anywhere */
     json_str(json, "titleName", out, out_sz);
 }
 
@@ -123,7 +118,7 @@ try_param_json(const char *dir, patchdl_title_t *t) {
     if (!n) return -1;
     buf[n] = '\0';
 
-    /* PS5 keys first, then PS4 fallbacks */
+    /* PS5 keys, then PS4 */
     if (json_str(buf, "titleId",   t->title_id, sizeof(t->title_id)) &&
         json_str(buf, "TITLE_ID",  t->title_id, sizeof(t->title_id)))
         return -1;
@@ -139,8 +134,6 @@ try_param_json(const char *dir, patchdl_title_t *t) {
 
     return 0;
 }
-
-/* ---------- param.sfo --------------------------------------------------- */
 
 #pragma pack(push, 1)
 typedef struct {
@@ -176,9 +169,7 @@ sfo_get(const uint8_t *buf, size_t bufsz, const char *key,
 
     entries = (const sfo_entry_t *)(buf + sizeof(*h));
 
-    /* The entry table itself must fit in the bytes we actually read; a crafted
-       param.sfo (from a shadow-mounted game dir) could otherwise drive
-       entries[i] past the buffer. */
+    /* a crafted param.sfo (shadowmount dir) must not walk entries[] off buf */
     if (sizeof(*h) + (size_t)h->num_entries * sizeof(sfo_entry_t) > bufsz)
         return -1;
 
@@ -190,8 +181,7 @@ sfo_get(const uint8_t *buf, size_t bufsz, const char *key,
 
         const char *k    = (const char *)(buf + key_off);
         size_t      kmax = bufsz - key_off;
-        /* Require the key to be NUL-terminated within the buffer before the
-           strcmp, otherwise it would read past the end. */
+        /* NUL inside buf, or strcmp reads past the end */
         if (strnlen(k, kmax) == kmax) continue;
         if (strcmp(k, key)) continue;
         if (entries[i].data_fmt != SFO_FMT_STR) return -1;
@@ -237,8 +227,6 @@ try_param_sfo(const char *dir, patchdl_title_t *t) {
     return 0;
 }
 
-/* ---------- install-type classification (file-based) -------------------- */
-
 static int
 path_exists(const char *dir, const char *rel) {
     char p[PATH_MAX];
@@ -247,7 +235,6 @@ path_exists(const char *dir, const char *rel) {
     return stat(sys_path(p), &st) == 0;
 }
 
-/* Read up to sz-1 bytes of dir/rel into buf (NUL-terminated). 0 on success. */
 static int
 read_small_file(const char *dir, const char *rel, char *buf, size_t sz) {
     char   p[PATH_MAX];
@@ -263,11 +250,8 @@ read_small_file(const char *dir, const char *rel, char *buf, size_t sz) {
     return 0;
 }
 
-/* Tell a Sony-signed package from a debug/fake-signed one by its header.
-   PS5 finalized image "\x7FFIH": byte 0x05 is 0x80 for retail, 0x00 for
-   debug (matches Sony's CDN patches, which start 7F 46 49 48 01 80).
-   PS4 container "\x7FCNT": bit 0 of byte 4 is set for retail, clear for a
-   fake package (same test Itemzflow uses). */
+/* PS5 "\x7FFIH": byte 5 is 0x80 retail, 0x00 debug (CDN patches start
+   7F 46 49 48 01 80). PS4 "\x7FCNT": byte 4 bit 0 set = retail (Itemzflow) */
 static patchdl_pkg_sign_t
 pkg_sign_state(const char *dir) {
     char          p[PATH_MAX];
@@ -289,9 +273,7 @@ pkg_sign_state(const char *dir) {
     return PATCHDL_PKG_UNREAD;
 }
 
-/* Keep only actual games: PS5 (PPSA) and PS4 (CUSA) title ids followed by
-   five digits. System apps (NPXS) and homebrew with made-up ids (PatchDL's
-   own tile PTDL00001, loaders, file managers) have no Sony updates. */
+/* PPSA/CUSA + 5 digits. NPXS and homebrew (PTDL00001 too) get no updates */
 static int
 is_game_title(const char *title_id) {
     if (strncmp(title_id, "PPSA", 4) && strncmp(title_id, "CUSA", 4))
@@ -302,13 +284,8 @@ is_game_title(const char *title_id) {
     return 1;
 }
 
-/* ---------- directory scanner ------------------------------------------- */
-
-/* Authoritative shadowmount test: ShadowMountPlus routes its images through
-   /mnt/shadowmnt (a pfs from /dev/lvdN there, then a nullfs onto the app dir),
-   so a title whose mount table references /mnt/shadowmnt is a shadowmount. The
-   on-disk mount.lnk marker is unreliable across reboots/remounts; the live
-   mount table is not. */
+/* ShadowMountPlus goes through /mnt/shadowmnt (pfs from /dev/lvdN, nullfs
+   onto the app dir). the live mount table is reliable, mount.lnk is not */
 static int
 mount_is_shadow(const char *title_id, const struct statfs *mounts, int nmounts) {
     for (int i = 0; i < nmounts; i++) {
@@ -321,17 +298,9 @@ mount_is_shadow(const char *title_id, const struct statfs *mounts, int nmounts) 
     return 0;
 }
 
-/*
- * Classify each /user/app/<TID> (verified on fw 11.60):
- *   - mount table references /mnt/shadowmnt for the title -> ShadowMountPlus
- *     mount (authoritative; mount.lnk is only a fallback hint)
- *   - app.pkg (no shadow mount) -> its header decides: Sony-signed is a
- *     genuine install (store or disc), debug/fake-signed is a fake package
- *     (listed, but never checked, downloaded or patched), unreadable is unknown
- *   - app.json with "fake":true and no app.pkg -> homebrew (skip). With an
- *     app.pkg the marker only says the package did not come from Sony's CDN
- *     (PatchDL's own loopback install sets it too), so the header decides.
- */
+/* checked on fw 11.60. app.pkg: header says retail or fake (fake is listed,
+   never patched). no app.pkg: shadowmount, or homebrew if app.json says
+   "fake":true. with app.pkg that marker only means "not from the CDN" */
 static int
 scan_one(const char *base, const char *name, patchdl_title_t *t,
          const struct statfs *mounts, int nmounts) {
@@ -358,35 +327,23 @@ scan_one(const char *base, const char *name, patchdl_title_t *t,
         if (strstr(appjson, "\"fake\"") && strstr(appjson, "true"))
             is_fake = 1;
     }
-    /* "fake": true marks both homebrew and installed fake packages. Only
-       homebrew (no app.pkg) drops out; a fake package stays in the list. */
     if (is_fake && !has_app_pkg)
         return -1;
 
-    /* app.pkg is the on-disk package of a genuine install; ShadowMountPlus
-       titles never have it (they have mounted/leftover sce_sys content). So
-       app.pkg is the reliable genuine-vs-shadow discriminator — independent of
-       whether the shadow image is currently mounted. */
+    /* shadowmounts never have app.pkg, mounted or not */
     if (has_app_pkg) {
-        /* app.json piece URLs are no signal: disc and store installs carry
-           CDN URLs there too. The package header is. */
+        /* CDN URLs in app.json say nothing, disc installs have them too */
         t->pkg_sign = pkg_sign_state(dir);
-        /* The header wins over the installer's fake marker: a retail package
-           installed from a local URL is marked fake but is still Sony's. The
-           marker only decides when the header can't be read. */
+        /* header beats the marker: a retail pkg installed from a local URL
+           gets marked fake too */
         t->source_type = t->pkg_sign == PATCHDL_PKG_RETAIL ? PATCHDL_SOURCE_OFFICIAL
                        : (is_fake || t->pkg_sign == PATCHDL_PKG_FAKE)
                                                    ? PATCHDL_SOURCE_FAKE
                                                    : PATCHDL_SOURCE_UNKNOWN;
-        /* A Sony-signed package someone installed with another tool, often
-           to keep one exact app version. PatchDL's own installs name its
-           loopback server in app.json. An update would replace that
-           version. */
+        /* Sony-signed but installed by another tool, often to pin a version.
+           PatchDL's own installs leave its port or "patchdl" in app.json
+           (slashes are escaped there, so match without) */
         {
-            /* PatchDL installs from its server (loopback or LAN address,
-               both on its port) or, as a fallback, from its download folder
-               (/user/data/patchdl/...). app.json escapes slashes, so match
-               pieces without them. */
             char port[16];
             snprintf(port, sizeof port, ":%d", PATCHDL_HTTP_PORT);
             t->sideloaded = is_fake && t->source_type == PATCHDL_SOURCE_OFFICIAL &&
@@ -394,7 +351,7 @@ scan_one(const char *base, const char *name, patchdl_title_t *t,
         }
     } else if (is_shadow || has_mountlnk || has_paramjson ||
                path_exists(dir, "sce_sys/param.sfo")) {
-        if (try_param_json(dir, t)) /* metadata from the mounted sce_sys */
+        if (try_param_json(dir, t)) /* from the mounted sce_sys */
             try_param_sfo(dir, t);
         t->source_type = PATCHDL_SOURCE_SHADOWMOUNT;
     } else {
@@ -432,13 +389,11 @@ scan_base(const char *base, patchdl_title_t *arr, size_t *cnt, size_t cap,
         if (scan_one(base, de->d_name, &arr[*cnt], mounts, nmounts) != 0)
             continue;
         if (already_seen(arr, *cnt, arr[*cnt].title_id))
-            continue; /* dedupe a title already found in an earlier base */
+            continue;
         (*cnt)++;
     }
     closedir(d);
 }
-
-/* ---------- public API -------------------------------------------------- */
 
 const char *
 patchdl_source_str(patchdl_source_t src) {
@@ -451,10 +406,6 @@ patchdl_source_str(patchdl_source_t src) {
     }
 }
 
-/* Open a title's icon0.png while the scan still sees the whole filesystem.
-   The web server can't reach these paths later, but an fd opened now stays
-   readable. Tries the app.db path first, then the usual install locations.
-   Returns an fd to a non-empty PNG of sane size, or -1. */
 #define ICON_MAX_BYTES (4 * 1024 * 1024)
 
 static int
@@ -476,12 +427,14 @@ open_png(const char *path) {
     return fd;
 }
 
+/* opened during the scan: the web server can't reach these paths later,
+   the fd keeps working. app.db path first */
 static int
 open_icon(const patchdl_title_t *t, const char *db_path) {
     static const char *const candidates[] = {
         "/user/appmeta/%s/icon0.png",
         "/user/appmeta/external/%s/icon0.png",
-        "%s/sce_sys/icon0.png",            /* source_path, e.g. a shadowmount */
+        "%s/sce_sys/icon0.png",            /* source_path (shadowmounts) */
         NULL,
     };
     char path[PATH_MAX];
@@ -495,10 +448,8 @@ open_icon(const patchdl_title_t *t, const char *db_path) {
     return fd;
 }
 
-/* After an install the console rewrites /user/appmeta/<id>/param.json at
-   once, while app.db keeps the old CONTENT_VERSION until later (seen: until
-   the game was started). Take the newer of the two so a finished update
-   doesn't look pending. */
+/* after an install appmeta's param.json updates right away, app.db only
+   later (seen: once the game was started). take the newer one */
 static void
 newer_appmeta_version(patchdl_title_t *t) {
     char path[PATH_MAX], buf[8192], ver[16] = {0};
@@ -515,9 +466,7 @@ newer_appmeta_version(patchdl_title_t *t) {
         snprintf(t->installed_version, sizeof(t->installed_version), "%s", ver);
 }
 
-/* Overlay app.db metadata (real title name, installed version, version.xml
-   URL) onto the scanned titles. Genuine installs have no readable param.json,
-   so this is the only source of their name/version. */
+/* genuine installs have no readable param.json, app.db is all there is */
 static int
 merge_appdb(patchdl_title_t *arr, size_t cnt) {
     patchdl_appinfo_t *info = NULL;
@@ -559,9 +508,7 @@ merge_appdb(patchdl_title_t *arr, size_t cnt) {
     return 0;
 }
 
-/* See patchdl_scan_lock — once set, patchdl_scan no longer swaps the root
-   (it rescans via the kept system root handle) and the debug dump returns
-   NULL, so neither can race the running MHD threads. */
+/* see patchdl_scan_lock */
 static _Atomic int g_scan_locked = 0;
 
 void
@@ -579,8 +526,7 @@ scan_all(patchdl_title_t **titles_out, size_t *count_out) {
     arr = calloc(MAX_TITLES, sizeof(*arr));
     if (!arr) { g_scan_step = "fail: oom"; return -1; }
 
-    /* Global mount table for shadowmount detection. getmntinfo's buffer is
-       libc-managed — must NOT be freed. */
+    /* libc owns this buffer, don't free it */
     g_scan_step = "mounts";
     nmounts = getmntinfo(&mounts, MNT_NOWAIT);
     if (nmounts < 0) { nmounts = 0; mounts = NULL; }
@@ -591,9 +537,8 @@ scan_all(patchdl_title_t **titles_out, size_t *count_out) {
     }
     g_scan_step = "appdb";
 
-    /* At startup a list without app.db data still beats none. A rescan
-       without it would wipe names and versions of a good list: fail instead
-       and keep the old one. */
+    /* at startup a list without app.db beats none. a rescan would wipe a
+       good list, so fail and keep the old one */
     if (merge_appdb(arr, cnt) && g_rel_paths) {
         free(arr);
         return -1;
@@ -605,8 +550,7 @@ scan_all(patchdl_title_t **titles_out, size_t *count_out) {
     return 0;
 }
 
-/* A rescan while other threads run: resolve every path from the system root
-   kept by the first scan, without touching the process root. */
+/* threads are running: everything via the kept root fd, root untouched */
 static int
 rescan_relative(patchdl_title_t **titles_out, size_t *count_out) {
     int cwd, rc;
@@ -618,7 +562,7 @@ rescan_relative(patchdl_title_t **titles_out, size_t *count_out) {
     g_rel_paths = 1;
     rc = scan_all(titles_out, count_out);
     g_rel_paths = 0;
-    (void)fchdir(cwd);   /* best effort: nothing else uses the cwd */
+    (void)fchdir(cwd);   /* nothing else uses the cwd */
     close(cwd);
     return rc;
 }
@@ -629,8 +573,7 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     intptr_t saved_root = 0, root_vnode;
     int using_vswap = 0, rc;
 
-    /* Elevate so privileged paths (the app.db under /system_data) are
-       readable; same authid ftpsrv uses. No-op without kernel R/W. */
+    /* ftpsrv's authid, for app.db in /system_data. no-op without kernel R/W */
     kernel_set_ucred_authid(pid, 0x4801000000000013L);
 
     if (atomic_load(&g_scan_locked))
@@ -639,9 +582,8 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     root_vnode = kernel_get_root_vnode();
     if (root_vnode) {
         saved_root = kernel_get_proc_rootdir(pid);
-        /* Only swap if we captured the current root, so we can always restore
-           it. Leaving the process rooted at the system root would make later
-           absolute-path writes land in the wrong place. */
+        /* only swap if the old root can go back, or later absolute writes
+           land in the wrong tree */
         if (saved_root) {
             kernel_set_proc_rootdir(pid, root_vnode);
             using_vswap = 1;
@@ -707,7 +649,7 @@ patchdl_scan_read_patch_file(const char *title_id, const char *name,
     return read_title_file(PATCH_DIRS, title_id, name, buf, sz);
 }
 
-/* Fold one stat result into an FNV-1a hash. */
+/* FNV-1a over mtime, size, inode */
 static unsigned long long
 sig_add(unsigned long long h, const char *rel) {
     struct stat st;
@@ -744,8 +686,6 @@ patchdl_scan_free(patchdl_title_t *titles, size_t count) {
     free(titles);
 }
 
-/* ---------- diagnostic dump --------------------------------------------- */
-
 static char *
 dbg_append(char *buf, size_t *len, size_t *cap, const char *s) {
     size_t sl = strlen(s);
@@ -774,8 +714,7 @@ patchdl_scan_debug_json(void) {
     struct statfs *mounts = NULL;
     int    nmounts;
 
-    /* getmntinfo returns the global mount table — no root-vnode swap needed.
-       Must NOT free the returned buffer (libc-managed). */
+    /* global table, no root swap needed. libc's buffer, don't free */
     nmounts = getmntinfo(&mounts, MNT_NOWAIT);
     if (nmounts < 0) { nmounts = 0; mounts = NULL; }
 
@@ -794,7 +733,7 @@ patchdl_scan_debug_json(void) {
     root_vnode = kernel_get_root_vnode();
     if (root_vnode) {
         saved_root = kernel_get_proc_rootdir(pid);
-        /* Only swap if we can restore it afterwards (see patchdl_scan). */
+        /* only if it can be restored, see patchdl_scan */
         if (saved_root) {
             kernel_set_proc_rootdir(pid, root_vnode);
             using_vswap = 1;

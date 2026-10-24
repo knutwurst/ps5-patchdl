@@ -17,10 +17,10 @@ typedef enum {
     PATCHDL_SOURCE_EXTERNAL    = 1,
     PATCHDL_SOURCE_SHADOWMOUNT = 2,
     PATCHDL_SOURCE_UNKNOWN     = 3,
-    PATCHDL_SOURCE_FAKE        = 4, /* debug/fake-signed package: not supported */
+    PATCHDL_SOURCE_FAKE        = 4, /* debug/fake-signed, not supported */
 } patchdl_source_t;
 
-/* Signing state read from the installed app.pkg header. */
+/* from the installed app.pkg header */
 typedef enum {
     PATCHDL_PKG_NONE    = 0, /* no app.pkg */
     PATCHDL_PKG_RETAIL  = 1,
@@ -37,29 +37,27 @@ typedef struct {
     char             mount_from[256];
     char             version_file_uri[256]; /* from app.db, for version.xml */
     patchdl_source_t source_type;
-    patchdl_pkg_sign_t pkg_sign;      /* app.pkg header verdict, for diagnostics */
-    int              sideloaded;       /* Sony-signed, but installed by another
-                                          tool (not Store, disc or PatchDL) */
-    int              icon_fd;          /* open icon0.png, or -1; see patchdl_scan */
-    /* populated by background verxml fetch — guarded by websrv mutex */
+    patchdl_pkg_sign_t pkg_sign;      /* for diagnostics */
+    int              sideloaded;       /* Sony-signed, other installer */
+    int              icon_fd;          /* open icon0.png, or -1 */
+    /* filled by the verxml fetch, under the websrv mutex */
     char             compatible_version[16];
     char             latest_version[16];
     char             latest_required_fw[16];
-    char             patch_url[512];   /* manifest_url if present, otherwise pkg URL */
-    char             delta_url[512];   /* DP.pkg bootstrap URL (always a PKG) */
+    char             patch_url[512];   /* manifest_url, else pkg URL */
+    char             delta_url[512];   /* DP.pkg bootstrap URL */
     char             patch_title_id[16]; /* target title id from version.xml */
-    char             patch_storage_title_id[16]; /* title id embedded in delta_url */
+    char             patch_storage_title_id[16]; /* from delta_url */
     int              verxml_done;
-    /* Prospero Patches lookup (best compatible patch from version history) */
+    /* Prospero Patches: best compatible patch from the history */
     char             prospero_version[16];
     char             prospero_required_fw[16];
     char             prospero_size[16];
     int              prospero_done;
-    /* Manifest URL derived from a link the user pasted from Prospero. When
-       set it replaces patch_url for download and install. */
+    /* from a pasted Prospero link, replaces patch_url when set */
     char             manual_url[512];
     char             manual_version[16];
-    int              enabled;          /* user policy, persisted in config.json */
+    int              enabled;          /* user setting, config.json */
     int              resumable;        /* a partial download is on disk */
     int              downloaded;       /* a finished download is on disk */
     long long        partial_bytes;    /* size of that partial, for the UI */
@@ -69,37 +67,28 @@ int         patchdl_scan(patchdl_title_t **titles_out, size_t *count_out);
 void        patchdl_scan_free(patchdl_title_t *titles, size_t count);
 const char *patchdl_source_str(patchdl_source_t src);
 
-/* Diagnostic: malloc'd JSON dump of the mount table + scan-base directory
-   listings. Caller frees. */
+/* mount table + scan dirs as malloc'd JSON, caller frees */
 char       *patchdl_scan_debug_json(void);
 
-/* Cheap change check for the automatic rescan: a hash over the title
-   directories and Sony's app.db. 0 when it can't be computed (no system root
-   handle), so callers never rescan on it. */
+/* cheap hash over the title dirs and app.db for the auto rescan. 0 without
+   the system root fd, never rescan on that */
 unsigned long long patchdl_scan_signature(void);
 
-/* Name of the step the running scan is in ("idle" when none). */
+/* current scan step, "idle" when none */
 const char *patchdl_scan_step(void);
 
-/* Read <title dir>/<name> of an installed title (e.g. app.json) through the
-   kept system root handle; thread-safe, no working-directory change.
-   0 on success with a NUL-terminated buf. */
-/* statvfs of a path as the system sees it (e.g. a game's /user/app/<id>),
-   through the system root kept by the first scan: the process's own root
-   doesn't show those paths. 0 on success. */
+/* statvfs via the kept system root, the process root doesn't see /user/app */
 struct statvfs;
 int patchdl_scan_sys_statvfs(const char *path, struct statvfs *out);
 
+/* <title dir>/<name> via the kept system root, thread-safe, cwd untouched */
 int patchdl_scan_read_app_file(const char *title_id, const char *name,
                                char *buf, size_t sz);
-/* Same for an installed PS4 patch: /user/patch/<id>/<name>. */
+/* same for PS4 patches in /user/patch/<id> */
 int patchdl_scan_read_patch_file(const char *title_id, const char *name,
                                  char *buf, size_t sz);
 
-/* Mark scan/debug as no longer safe to call (must be set after MHD worker
-   threads come up — patchdl_scan performs a process-wide vnode swap that
-   would race any concurrent thread). After this is set, patchdl_scan rescans
-   through the system root handle kept by the first scan (working directory
-   only, one caller at a time) and the debug dump returns NULL. Call once
-   during startup, after MHD_start_daemon. */
+/* once, after MHD_start_daemon: the root vnode swap is process-wide and
+   would race the workers. after that scans go via the kept root fd (cwd
+   only, one caller at a time) and the debug dump returns NULL */
 void        patchdl_scan_lock(void);

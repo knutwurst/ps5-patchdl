@@ -36,8 +36,7 @@ main(int argc, char** argv) {
 
   signal(SIGPIPE, SIG_IGN);
 
-  /* Identify ourselves in the PS5 process list and replace any stale
-     instance so re-deploys are idempotent and the HTTP port is free. */
+  /* kill the old instance from the last deploy, it still holds the port */
   patchdl_proc_set_name(PATCHDL_PROC_NAME);
   patchdl_proc_kill_others(PATCHDL_PROC_NAME);
 
@@ -48,7 +47,6 @@ main(int argc, char** argv) {
     return 1;
   }
 
-  /* On-screen debug notification with the URL to open. */
   patchdl_notify_startup(port);
 
   while(1) {

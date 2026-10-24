@@ -19,10 +19,8 @@
 
 #define APP_DB_URI \
     "file:/system_data/priv/mms/app.db?immutable=1"
-/* A rescan can't open app.db by a relative path: SQLite turns it into an
-   absolute one with getcwd(), which resolves inside our own root again. So
-   it copies the file out through the working directory (the system root,
-   see patchdl_scan) and opens the copy. */
+/* sqlite getcwd()s a relative path back into the payload's own root, so a
+   rescan copies app.db out via the cwd (system root, see patchdl_scan) */
 #define APP_DB_REL      "system_data/priv/mms/app.db"
 #define APP_DB_SNAPSHOT "/data/patchdl/.appdb.snapshot"
 #define APP_DB_URI_SNAPSHOT "file:" APP_DB_SNAPSHOT "?immutable=1"
@@ -74,8 +72,7 @@ snapshot_appdb(void) {
 
 #define APPDB_MAX 1024
 
-/* Extract a string value for `key` from a flat PS5 AppInfoJson blob.
-   Trailing whitespace (Sony pads VERSION_FILE_URI) is stripped. */
+/* flat AppInfoJson only. Sony pads VERSION_FILE_URI with spaces */
 static void
 json_str(const char *json, const char *key, char *out, size_t out_sz) {
     char        needle[48];
@@ -93,8 +90,7 @@ json_str(const char *json, const char *key, char *out, size_t out_sz) {
         p++;
     if (*p != '"') return;
     p++;
-    /* Copy with minimal JSON unescaping — AppInfoJson escapes URL slashes
-       as "\/", so VERSION_FILE_URI arrives as "https:\/\/..." otherwise. */
+    /* URLs come as https:\/\/..., so a bit of unescaping */
     len = 0;
     while (*p && *p != '"' && len < out_sz - 1) {
         if (*p == '\\' && p[1]) {
@@ -103,7 +99,7 @@ json_str(const char *json, const char *key, char *out, size_t out_sz) {
             case 'n': out[len++] = '\n'; break;
             case 't': out[len++] = '\t'; break;
             case 'r': out[len++] = '\r'; break;
-            default:  out[len++] = *p;   break; /* \/  \\  \"  -> literal */
+            default:  out[len++] = *p;   break;
             }
             p++;
             continue;
@@ -126,9 +122,6 @@ load_db(const char *uri, patchdl_appinfo_t **out, size_t *count) {
     *out = NULL;
     *count = 0;
 
-    /* FULLMUTEX: today only the startup thread calls this, but future code
-       paths (a manual rescan triggered from the HTTP thread) would otherwise
-       race the SQLite handle. Cost is one mutex per call. */
     if (sqlite3_open_v2(uri, &db,
                         SQLITE_OPEN_READONLY | SQLITE_OPEN_URI |
                         SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
@@ -164,8 +157,7 @@ load_db(const char *uri, patchdl_appinfo_t **out, size_t *count) {
         if (json) {
             json_str(json, "CONTENT_VERSION", e->content_version,
                      sizeof(e->content_version));
-            /* PS4 titles carry no CONTENT_VERSION; APP_VER is theirs, and
-               it includes an installed patch. */
+            /* PS4: no CONTENT_VERSION, APP_VER includes the patch */
             if (!e->content_version[0])
                 json_str(json, "APP_VER", e->content_version,
                          sizeof(e->content_version));
@@ -175,17 +167,14 @@ load_db(const char *uri, patchdl_appinfo_t **out, size_t *count) {
         n++;
     }
     sqlite3_finalize(stmt);
-    /* Anything but the end of the table (or the row cap) means the read
-       broke off, e.g. on a copy taken while the console wrote the file:
-       report failure instead of a list that silently lacks titles. */
+    /* read broke off (copy taken mid-write?): fail, don't drop titles */
     if (step != SQLITE_DONE && step != SQLITE_ROW) {
         free(arr);
         sqlite3_close(db);
         return -1;
     }
 
-    /* Icon paths in a separate query: if a firmware lacks the icon0Info
-       column, only the icons go missing, not the whole title list. */
+    /* own query, so a fw without icon0Info only loses the icons */
     if (sqlite3_prepare_v2(db,
             "SELECT titleId, icon0Info FROM tbl_contentinfo "
             "WHERE icon0Info IS NOT NULL AND icon0Info != '';",

@@ -19,9 +19,7 @@
 #define PROSPERO_API  PROSPERO_BASE "/api/internal"
 #define BUF_MAX       (512 * 1024)
 
-/* Prospero firmware strings use the same hex-digits-as-decimal encoding
-   as Sony's system_ver: "10.20.00.06" packs to 0x10200006.  Parse with
-   %x so the hex bytes compare correctly against g_fw.bin. */
+/* "10.20.00.06" is 0x10200006 like Sony's system_ver, hence %x */
 static uint32_t
 fw_str_to_bin(const char *s) {
     unsigned a = 0, b = 0, c = 0, d = 0;
@@ -34,7 +32,6 @@ fw_bin_to_display(uint32_t bin, char *out, size_t sz) {
     snprintf(out, sz, "%x.%02x", (bin >> 24) & 0xff, (bin >> 16) & 0xff);
 }
 
-/* Extract the first occurrence of `data-key="<hex>"` from HTML. */
 static int
 extract_data_key(const char *html, char *out, size_t out_sz) {
     const char *needle = "data-key=\"";
@@ -50,8 +47,7 @@ extract_data_key(const char *html, char *out, size_t out_sz) {
     return 0;
 }
 
-/* Find the next JSON string value for a given key inside a JSON object
-   fragment.  Crude but sufficient for the predictable Prospero response. */
+/* poor man's JSON, good enough for what the site sends */
 static const char *
 json_str_val(const char *json, const char *key, char *out, size_t out_sz) {
     char needle[64];
@@ -70,7 +66,6 @@ json_str_val(const char *json, const char *key, char *out, size_t out_sz) {
     return p + len + 1;
 }
 
-/* Check if a JSON fragment contains "success":true */
 static int
 json_success(const char *json) {
     const char *p = strstr(json, "\"success\"");
@@ -80,16 +75,14 @@ json_success(const char *json) {
     return !strncmp(p, "true", 4);
 }
 
-/* PS5 titles live on Prospero Patches, PS4 titles on its sister site Orbis
-   Patches; both serve the same page and API. */
+/* PS4 titles are on Orbis Patches, same page and API */
 const char *
 patchdl_patchsite_base(const char *title_id) {
     return (title_id && !strncmp(title_id, "CUSA", 4))
         ? "https://orbispatches.com" : PROSPERO_BASE;
 }
 
-/* The API key on the title page: Prospero puts it in data-key="<hex>",
-   Orbis in data-loadparams="{ 'titleid': ..., 'key': '<hex>' }". */
+/* Prospero has data-key="<hex>", Orbis hides it in data-loadparams */
 static int
 extract_key(const char *html, char *out, size_t out_sz) {
     const char *p;
@@ -117,7 +110,7 @@ patchdl_patchsite_versions(const char *title_id, patchdl_patch_version_t *out,
     *count = 0;
     if (!title_id || !out || max <= 0) return -1;
 
-    /* Step 1: fetch the title page for the API key. */
+    /* title page first, it carries the API key */
     memset(&buf, 0, sizeof(buf));
     buf.max = BUF_MAX;
     snprintf(url, sizeof(url), "%s/%.16s", base, title_id);
@@ -129,9 +122,8 @@ patchdl_patchsite_versions(const char *title_id, patchdl_patch_version_t *out,
     }
     free(buf.data);
 
-    /* Step 2: POST loadpatches. The API expects JSON in the body but
-       application/x-www-form-urlencoded as Content-Type — this is how
-       the website and every known third-party client calls it. */
+    /* JSON body with a form-urlencoded content type. the site does it
+       this way, so I do too */
     snprintf(body, sizeof(body),
              "{\"titleid\":\"%.16s\",\"key\":\"%s\"}", title_id, key);
     snprintf(url, sizeof(url), "%s/api/internal/loadpatches", base);
@@ -146,9 +138,8 @@ patchdl_patchsite_versions(const char *title_id, patchdl_patch_version_t *out,
         return -1;
     }
 
-    /* Each entry starts with "is_latest" and carries content_ver (Prospero)
-       or version (Orbis), filesize and required_firmware. Bound each lookup
-       to its own entry. */
+    /* entries start at "is_latest", copy each one out so a lookup can't
+       pick up the next entry's fields */
     for (cur = strstr(buf.data, "\"is_latest\""); cur && n < max; cur = next) {
         char  entry[2048], fw[32] = {0};
         size_t len;
@@ -167,9 +158,7 @@ patchdl_patchsite_versions(const char *title_id, patchdl_patch_version_t *out,
         json_str_val(entry, "required_firmware", fw, sizeof fw);
         if (!v->version[0]) continue;
         if (strncmp(title_id, "CUSA", 4)) {
-            /* PS5 "07.01.01.00", packed like Sony's system_ver. Without a
-               readable requirement the version counts as needing a newer
-               firmware than any console has: never offer a guess. */
+            /* unreadable requirement: treat as too new, don't guess */
             if (strchr(fw, '.') && strchr(strchr(fw, '.') + 1, '.')) {
                 v->fw_bin = fw_str_to_bin(fw);
                 fw_bin_to_display(v->fw_bin, v->required_fw, sizeof v->required_fw);
@@ -178,7 +167,7 @@ patchdl_patchsite_versions(const char *title_id, patchdl_patch_version_t *out,
                 snprintf(v->required_fw, sizeof v->required_fw, "?");
             }
         } else {
-            /* PS4 "3.00": a PS4 firmware, never a limit on the PS5 */
+            /* PS4 firmware, doesn't limit the PS5 */
             snprintf(v->required_fw, sizeof v->required_fw, "%s", fw);
             v->fw_bin = 0;
         }
@@ -197,14 +186,13 @@ patchdl_prospero_query(const char *title_id, uint32_t fw_bin,
 
     if (!title_id || !out) return -1;
     memset(out, 0, sizeof(*out));
-    /* The whole history: the newest versions may all need newer firmware. */
+    /* full list, the newest ones may all need a newer fw */
     if (!(list = calloc(PATCHSITE_MAX_VERSIONS, sizeof *list))) return -1;
     if (patchdl_patchsite_versions(title_id, list, PATCHSITE_MAX_VERSIONS, &n)) {
         free(list);
         return -1;
     }
 
-    /* the newest version whose firmware requirement is met */
     for (int i = 0; i < n; i++)
         if (list[i].fw_bin <= fw_bin &&
             (best < 0 || strcmp(list[i].version, list[best].version) > 0))

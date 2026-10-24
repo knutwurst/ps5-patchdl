@@ -28,8 +28,7 @@ SRCS := src/main.c \
         src/patchdl_notify.c \
         src/patchdl_tile.c
 
-# patchdl_tile.c uses .incbin to embed param.json + icon0.png; touching the
-# assets must trigger a rebuild.
+# .incbin'd by patchdl_tile.c, make can't see that on its own
 TILE_ASSETS := assets/param.json assets/icon0.png
 
 WEB_ASSETS := web/index.html web/styles.css web/i18n.js web/app.js
@@ -63,7 +62,7 @@ gen/web/%.c: web/% scripts/gen_asset_module.py | gen/web
 $(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c
 	$(CC) $(SQLITE_CFLAGS) -c -o $@ $<
 
-# Headers too: a changed header (the version string, say) must rebuild.
+# headers too, or a version bump doesn't rebuild
 $(BIN): $(SRCS) $(wildcard src/*.h) $(GEN_SRCS) $(SQLITE_OBJ) $(TILE_ASSETS)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(GEN_SRCS) $(SQLITE_OBJ) $(LDADD)
 

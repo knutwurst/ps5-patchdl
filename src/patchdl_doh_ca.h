@@ -9,12 +9,7 @@
 
 #pragma once
 
-/*
- * Public root CAs of the DNS-over-HTTPS resolvers PatchDL falls back to when
- * plain DNS is blocked or answers with a sinkhole address. Only the DoH
- * requests use these; Sony's hosts stay pinned to the SCEI root
- * (patchdl_ca.h). Public, non-secret certificates.
- */
+/* roots for the DoH fallback only. Sony stays pinned to the SCEI root */
 static const char PATCHDL_DOH_ROOTS_PEM[] =
     /* SSL.com Root Certification Authority ECC (Cloudflare 1.1.1.1 / 1.0.0.1) */
     "-----BEGIN CERTIFICATE-----\n"
