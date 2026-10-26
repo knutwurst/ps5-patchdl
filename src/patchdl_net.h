@@ -47,6 +47,8 @@ typedef struct {
     int              count;
     long long        total;   /* sum of piece sizes */
     char             crc_url[768]; /* playgoChunkCrcUrl, or "" */
+    char             crc_hash[80]; /* playgoChunkCrcHashValue, or "" */
+    char             digest[80];   /* packageDigest, or "" */
 } patchdl_manifest_t;
 
 /* pieces are checked to tile the file without gaps.

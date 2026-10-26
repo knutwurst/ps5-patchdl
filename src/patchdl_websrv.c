@@ -764,13 +764,16 @@ install_reading(const char *title_id) {
     return busy;
 }
 
-/* serve a downloaded pkg back to Sony's installer over localhost */
+/* serve a downloaded pkg back to Sony's installer over localhost.
+   /api/pkg/<tid>/<off>/<size>/<file> serves one piece of it, that's what
+   the local manifest points at */
 static enum MHD_Result
 queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     const char *prefix = "/api/pkg/";
-    const char *p, *slash;
+    const char *p, *slash, *rest;
     char title_id[32], file[160], path[360];
     size_t len;
+    unsigned long long win_off = 0, win_size = 0;
     struct stat st;
     int fd;
     const char *range;
@@ -794,10 +797,19 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     memcpy(title_id, p, len);
     title_id[len] = '\0';
 
-    len = strlen(slash + 1);
+    rest = slash + 1;
+    if (*rest >= '0' && *rest <= '9') {
+        char *e1, *e2;
+        win_off  = strtoull(rest, &e1, 10);
+        win_size = *e1 == '/' ? strtoull(e1 + 1, &e2, 10) : 0;
+        if (*e1 != '/' || !win_size || *e2 != '/' || !e2[1])
+            return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+        rest = e2 + 1;
+    }
+    len = strlen(rest);
     if (len >= sizeof(file))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
-    memcpy(file, slash + 1, len + 1);
+    memcpy(file, rest, len + 1);
 
     if (!path_segment_safe(title_id) || !path_segment_safe(file))
         return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
@@ -818,6 +830,13 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     }
 
     total = (uint64_t)st.st_size;
+    if (win_size) {
+        if (win_off >= total || win_size > total - win_off) {
+            close(fd);
+            return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+        }
+        total = win_size;
+    }
     end = total - 1;
     send_size = total;
 
@@ -860,7 +879,7 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
         return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
     }
     reader->fd    = fd;
-    reader->start = start;
+    reader->start = win_off + start;
     reader->size  = send_size;
     snprintf(reader->title_id, sizeof reader->title_id, "%.9s", title_id);
     {
@@ -2022,6 +2041,61 @@ settle_active_locked(dl_job_t *job) {
     }
 }
 
+/* only hex goes into the local manifest */
+static int
+hex_only(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++)
+        if (!isxdigit((unsigned char)*s)) return 0;
+    return 1;
+}
+
+/* <name>.json next to the pkg: Sony's manifest with every piece pointing at
+   PatchDL. installed from this the console writes an app.json like after a
+   normal Sony update; from the bare pkg it writes "fake":true */
+static void
+write_local_manifest(const char *dest, const char *title_id,
+                     const patchdl_manifest_t *mf) {
+    const char *file = strrchr(dest, '/');
+    size_t      n = strlen(dest), stem;
+    char        path[340], tmp[352];
+    jbuf_t      j = {0};
+    FILE       *fp;
+
+    if (!file || n < 5 || strcmp(dest + n - 4, ".pkg") || !strncmp(title_id, "CUSA", 4))
+        return;                             /* PS4 never tried this way */
+    file++;
+    stem = strlen(file) - 4;
+    snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+
+    jbuf_appendf(&j, "{\"originalFileSize\":%lld,\"numberOfSplitFiles\":%d,",
+                 mf->total, mf->count);
+    if (hex_only(mf->digest))
+        jbuf_appendf(&j, "\"packageDigest\":\"%s\",", mf->digest);
+    if (mf->crc_url[0] && hex_only(mf->crc_hash))
+        jbuf_appendf(&j, "\"playgoChunkCrcHashValue\":\"%s\","
+                     "\"playgoChunkCrcUrl\":\"http://127.0.0.1:%d/api/pkg/%s/%.*s.crc\",",
+                     mf->crc_hash, PATCHDL_HTTP_PORT, title_id, (int)stem, file);
+    jbuf_append(&j, "\"pieces\":[");
+    for (int i = 0; i < mf->count; i++) {
+        jbuf_appendf(&j, "%s{\"url\":\"http://127.0.0.1:%d/api/pkg/%s/%lld/%lld/%s\","
+                     "\"fileOffset\":%lld,\"fileSize\":%lld",
+                     i ? "," : "", PATCHDL_HTTP_PORT, title_id,
+                     mf->pieces[i].offset, mf->pieces[i].size, file,
+                     mf->pieces[i].offset, mf->pieces[i].size);
+        if (hex_only(mf->pieces[i].hash))
+            jbuf_appendf(&j, ",\"hashValue\":\"%s\"", mf->pieces[i].hash);
+        jbuf_append(&j, "}");
+    }
+    jbuf_append(&j, "]}");
+    if (j.buf && (fp = fopen(tmp, "w"))) {
+        int bad = fputs(j.buf, fp) < 0;
+        if (fclose(fp) || bad || rename(tmp, path)) unlink(tmp);
+    }
+    free(j.buf);
+}
+
 /* a pkg copied in by hand may have another name: one .pkg of the right
    size gets taken */
 static int
@@ -2159,6 +2233,7 @@ admit_next(void) {
                 if (ftruncate(fd, (off_t)total) == 0) ok = 1;
                 else { close(fd); fd = -1; }
             }
+            if (ok) write_local_manifest(dest, q_title, &mf);
             /* the console asks for <name>.crc at the end of an install */
             if (ok && mf.crc_url[0]) {
                 char crc[320];

@@ -1159,6 +1159,10 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
     }
     json_string_after(buf.data, "playgoChunkCrcUrl", out->crc_url,
                       sizeof(out->crc_url), NULL);
+    json_string_after(buf.data, "playgoChunkCrcHashValue", out->crc_hash,
+                      sizeof(out->crc_hash), NULL);
+    json_string_after(buf.data, "packageDigest", out->digest,
+                      sizeof(out->digest), NULL);
     free(buf.data);
     if (n == 0) { patchdl_manifest_free(out); set_last("bad_manifest", 0, g_last.http_code); return -1; }
     out->total = running;

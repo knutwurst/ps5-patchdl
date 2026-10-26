@@ -611,7 +611,8 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         char              file_uri[1100];
         char              http_loop_uri[1200] = {0};
         char              http_lan_uri[1200] = {0};
-        const char       *uris[4];
+        char              json_loop_uri[1200] = {0};
+        const char       *uris[5];
         ai_meta_info_t    meta    = {0};
         ai_pkg_info_t     pkg     = {0};
         /* 0x2700 bytes, too much for the MHD worker stack */
@@ -640,6 +641,19 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                     snprintf(http_loop_uri, sizeof(http_loop_uri),
                              "http://127.0.0.1:%d/api/pkg/%s/%s",
                              PATCHDL_HTTP_PORT, title_id, file_base + 1);
+                    /* the local manifest from the downloader, if there is one */
+                    {
+                        char   jpath[1024];
+                        size_t ln = strlen(local_path), fl = strlen(file_base + 1);
+                        if (ln > 4 && fl > 4 && !strcmp(local_path + ln - 4, ".pkg") &&
+                            snprintf(jpath, sizeof jpath, "%.*s.json",
+                                     (int)(ln - 4), local_path) < (int)sizeof jpath &&
+                            stat(jpath, &st) == 0)
+                            snprintf(json_loop_uri, sizeof(json_loop_uri),
+                                     "http://127.0.0.1:%d/api/pkg/%s/%.*s.json",
+                                     PATCHDL_HTTP_PORT, title_id,
+                                     (int)(fl - 4), file_base + 1);
+                    }
                     local_ip(ip, sizeof(ip));
                     if (ip[0])
                         snprintf(http_lan_uri, sizeof(http_lan_uri),
@@ -650,10 +664,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         }
         /* HTTP first: the installer pulls ranges from /api/pkg, and that's
            the route that really writes content. bare paths last */
-        uris[0]                 = http_loop_uri[0] ? http_loop_uri : NULL;
-        uris[1]                 = http_lan_uri[0] ? http_lan_uri : NULL;
-        uris[2]                 = sdk_path;      /* /user/data/... */
-        uris[3]                 = file_uri;       /* file:///user/data/... */
+        uris[0]                 = json_loop_uri[0] ? json_loop_uri : NULL;
+        uris[1]                 = http_loop_uri[0] ? http_loop_uri : NULL;
+        uris[2]                 = http_lan_uri[0] ? http_lan_uri : NULL;
+        uris[3]                 = sdk_path;      /* /user/data/... */
+        uris[4]                 = file_uri;       /* file:///user/data/... */
         meta.ex_uri             = "";
         meta.playgo_scenario_id = "";
         /* empty like etaHEN's DPI, the installer takes the pkg's own id */
@@ -664,8 +679,8 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
 
         {
             char        tries[260] = {0};
-            const char *labels[4]  = { "loop", "lan", "userdata", "file" };
-            for (int i = 0; i < 4; i++) {
+            const char *labels[5]  = { "manifest", "loop", "lan", "userdata", "file" };
+            for (int i = 0; i < 5; i++) {
                 if (!uris[i]) continue;
                 memset(&pkg, 0, sizeof(pkg));
                 memset(playgo, 0, sizeof(*playgo));
