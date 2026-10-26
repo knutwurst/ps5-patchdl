@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <sys/types.h>
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -87,6 +89,11 @@ int patchdl_scan_read_app_file(const char *title_id, const char *name,
 /* same for PS4 patches in /user/patch/<id> */
 int patchdl_scan_read_patch_file(const char *title_id, const char *name,
                                  char *buf, size_t sz);
+
+/* len bytes at offset of an installed app's file, e.g. a slice of app.pkg.
+   bytes read, -1 if the file isn't there */
+ssize_t patchdl_scan_read_app_range(const char *title_id, const char *name,
+                                    long long offset, void *buf, size_t len);
 
 /* once, after MHD_start_daemon: the root vnode swap is process-wide and
    would race the workers. after that scans go via the kept root fd (cwd

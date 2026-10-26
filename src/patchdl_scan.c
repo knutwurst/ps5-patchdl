@@ -649,6 +649,24 @@ patchdl_scan_read_patch_file(const char *title_id, const char *name,
     return read_title_file(PATCH_DIRS, title_id, name, buf, sz);
 }
 
+ssize_t
+patchdl_scan_read_app_range(const char *title_id, const char *name,
+                            long long offset, void *buf, size_t len) {
+    char path[PATH_MAX];
+    if (g_sysroot_fd < 0 || offset < 0 || !len) return -1;
+    for (int i = 0; SCAN_DIRS[i]; i++) {
+        int     fd;
+        ssize_t n;
+        snprintf(path, sizeof(path), "%s/%s/%s", SCAN_DIRS[i] + 1, title_id, name);
+        fd = openat(g_sysroot_fd, path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        n = pread(fd, buf, len, (off_t)offset);
+        close(fd);
+        return n;
+    }
+    return -1;
+}
+
 /* FNV-1a over mtime, size, inode */
 static unsigned long long
 sig_add(unsigned long long h, const char *rel) {

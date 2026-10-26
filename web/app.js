@@ -116,6 +116,7 @@ let state = {
 
 let downloadPollTimer = null;
 let installPollTimer = null;
+const freshInstalling = new Map();   // title id -> name of games being replaced
 let emptyPolls = 0;
 const dlMeta = {}; // title_id: { bytes, t, speed }
 
@@ -538,6 +539,13 @@ async function loadInitialData({ quiet = false } = {}) {
       if (old._localDownloading) g._localDownloading = true;
       if (old._wasActive) g._wasActive = true;
     }
+  });
+  // a game being replaced drops out of the console's list for a moment,
+  // its card stays until the install is over
+  freshInstalling.forEach((name, id) => {
+    if (titles.some((g) => g.title_id.startsWith(id))) return;
+    const old = [...prev.values()].find((g) => g.title_id.startsWith(id));
+    if (old) titles.push(old);
   });
 
   // one failed request on a quiet reload shouldn't swap in the demo data
@@ -1083,6 +1091,14 @@ function stopInstallPolling() {
   installPollTimer = null;
 }
 
+function installEndText(st) {
+  if (st.phase === "stalled") return t("install.msg.stalled");
+  if (!st.verified) return t("install.msg.unconfirmed");
+  return t(st.deleted ? "install.msg.verifiedDeleted"
+    : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
+    : "install.msg.verifiedKept");
+}
+
 async function refreshInstallStatus() {
   let s;
   try {
@@ -1093,8 +1109,10 @@ async function refreshInstallStatus() {
     return;
   }
 
-  if (!s || !s.active) {
-    if (!state.titles.some((g) => g.installing)) stopInstallPolling();
+  // streams come along even before the installer ever ran (a replace whose
+  // uninstall failed), so only bail when there's nothing at all
+  if (!s || (!s.active && !(Array.isArray(s.streams) && s.streams.length))) {
+    if (!state.titles.some((g) => g.installing) && !freshInstalling.size) stopInstallPolling();
     return;
   }
 
@@ -1105,7 +1123,20 @@ async function refreshInstallStatus() {
     let ended = false, changed = false;
     streams.forEach((st) => {
       const game = state.titles.find((g) => g.title_id.startsWith(st.title_id));
-      if (!game) return;
+      if (!game) {
+        // a fresh install from Downloads: no card until the console registers it
+        if (freshInstalling.has(st.title_id) && (st.phase === "done" || st.phase === "stalled")) {
+          const name = freshInstalling.get(st.title_id) || st.title_id;
+          freshInstalling.delete(st.title_id);
+          const msg = installEndText(st);
+          addLog("log.installEnded", { id: st.title_id, msg });
+          showToast(t("toast.installEnded", { name, msg }));
+          ended = true;
+        }
+        return;
+      }
+      // a replaced game: its card follows the install until the end
+      if (freshInstalling.has(st.title_id)) game.installing = true;
       const over = st.phase === "done" || st.phase === "stalled";
       if (over && !game.installing) return;   // finished before this page watched it
       const total = Number(st.total) || 0;
@@ -1119,24 +1150,20 @@ async function refreshInstallStatus() {
       game.installDone = read;
       game.installTotal = total;
       if (over) {
-        const msg = st.phase === "stalled"
-          ? t("install.msg.stalled")
-          : st.verified
-            ? t(st.deleted ? "install.msg.verifiedDeleted"
-                : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
-                : "install.msg.verifiedKept")
-            : t("install.msg.unconfirmed");
+        freshInstalling.delete(st.title_id);
+        const msg = installEndText(st);
         addLog("log.installEnded", { id: game.title_id, msg });
         showToast(t("toast.installEnded", { name: game.name, msg }));
         ended = true;
       }
     });
     if (changed) renderGames();
-    if (state.titles.some((g) => g.installing)) startInstallPolling();
+    if (state.titles.some((g) => g.installing) || freshInstalling.size) startInstallPolling();
     if (ended) {
       renderLogs();
-      if (!state.titles.some((g) => g.installing)) stopInstallPolling();
+      if (!state.titles.some((g) => g.installing) && !freshInstalling.size) stopInstallPolling();
       loadInitialData({ quiet: true });
+      loadStorage();
     }
     return;
   }
@@ -1488,18 +1515,28 @@ async function doDownload(game) {
   }
 }
 
-async function doInstall(game, force = false) {
+async function doInstall(game, force = false, replace = false) {
   const wasDownloaded = game.downloaded;
   game.installing = true;
   game.installStatus = "starting";
   game.installProgress = 0;
   game.downloaded = false;
   renderGames();
+  // the game drops out of the list while it's replaced, keep its card from
+  // the moment the request goes out
+  if (replace) freshInstalling.set(game.title_id.slice(0, 9), game.name);
   try {
-    await postJson(API.action(game.title_id, "install") + (force ? "?force=1" : ""), {});
+    const q = [force && "force=1", replace && "replace=1"].filter(Boolean).join("&");
+    await postJson(API.action(game.title_id, "install") + (q ? `?${q}` : ""), {});
   } catch (error) {
     game.downloaded = wasDownloaded;   // refused, package untouched
     const b = (error && error.body) || {};
+    if (replace) freshInstalling.delete(game.title_id.slice(0, 9));
+    // a reload during the request may have put a fresh object on the card,
+    // it copied installing over. nothing started, so clear it everywhere
+    if (b.reason !== "install_running")
+      state.titles.filter((g) => g.title_id === game.title_id && g !== game)
+        .forEach((g) => { g.installing = false; g.installStatus = undefined; g.downloaded = wasDownloaded; });
     if (b.reason === "install_space" && !force) {
       // tight on the game's drive, the console would likely stop right after
       // the header. let the user decide
@@ -1507,9 +1544,18 @@ async function doInstall(game, force = false) {
       renderGames();
       if (window.confirm(t("install.lowSpace", {
             name: game.name, need: formatBytes(b.need_bytes), free: formatBytes(b.free_bytes) })))
-        return doInstall(game, true);
+        return doInstall(game, true, replace);
       addLog("log.installBlocked", { id: game.title_id, why: t("reason.install_space") });
       renderLogs();
+      return false;
+    }
+    if (b.reason === "needs_reinstall" && !replace) {
+      // the update doesn't build on the installed version (a disc build, say).
+      // it only goes on as the whole game, one question and the rest is the same
+      game.installing = false;
+      renderGames();
+      if (window.confirm(t("install.confirmReplace", { name: game.name })))
+        return doInstall(game, force, true);
       return false;
     }
     if (error.body && error.body.reason === "install_running") {

@@ -107,6 +107,7 @@ typedef int (*ai_install_by_pkg_fn)(ai_meta_info_t *meta, ai_pkg_info_t *info,
 typedef int (*ai_title_from_pkg_fn)(const char *path, char *title_id, int *is_app);
 typedef int (*ai_content_from_pkg_fn)(const char *path, char *content_id, int *is_app);
 typedef int (*ai_get_status_fn)(char *content_id_out, ai_install_status_t *status);
+typedef int (*ai_uninstall_fn)(const char *title_id);
 
 static ai_init_fn             ai_initialize;
 static ai_install_pkg_fn      ai_install_pkg;
@@ -114,6 +115,7 @@ static ai_install_by_pkg_fn   ai_install_by_package;
 static ai_title_from_pkg_fn   ai_title_from_pkg;
 static ai_content_from_pkg_fn ai_content_from_pkg;
 static ai_get_status_fn       ai_get_status;
+static ai_uninstall_fn        ai_uninstall;
 
 /* no sce lib linking (elfldr refuses the ELF), no raw sceKernelLoadStartModule
    (wedged the process, ask me how I know). sysmodule loader + dlsym instead.
@@ -310,6 +312,8 @@ backend_init_thread(void *arg) {
                                                           "sceAppInstUtilGetContentIdFromPkg");
     ai_get_status         = (ai_get_status_fn)dynsym("libSceAppInstUtil.sprx",
                                                      "sceAppInstUtilGetInstallStatus");
+    ai_uninstall          = (ai_uninstall_fn)dynsym("libSceAppInstUtil.sprx",
+                                                    "sceAppInstUtilAppUnInstall");
 
     fill_probe();
 
@@ -612,7 +616,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         char              http_loop_uri[1200] = {0};
         char              http_lan_uri[1200] = {0};
         char              json_loop_uri[1200] = {0};
-        char              icon[64];
+        char              icon[1040];
         const char       *uris[5];
         ai_meta_info_t    meta    = {0};
         ai_pkg_info_t     pkg     = {0};
@@ -679,6 +683,13 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         meta.content_name       = name && name[0] ? name : "PatchDL";
         snprintf(icon, sizeof icon, "/user/appmeta/%.9s/icon0.png",
                  expected_title_id ? expected_title_id : "");
+        if (stat(icon, &st) != 0) {
+            /* game got uninstalled for a fresh install and its appmeta
+               went with it. the cover from the pkg sits next to it */
+            const char *sl = strrchr(sdk_path, '/');
+            snprintf(icon, sizeof icon, "%.*s/icon0.png",
+                     sl ? (int)(sl - sdk_path) : 0, sdk_path);
+        }
         meta.icon_url           = stat(icon, &st) == 0 ? icon : "";
 
         {
@@ -791,5 +802,22 @@ patchdl_install_app_pkg(const char *local_path,
                  (target_content_id ? target_content_id : ""));
     else
         snprintf(msg, msg_sz, "install rejected rc=0x%08x", (unsigned)rc);
+    return rc;
+}
+
+int
+patchdl_install_uninstall(const char *title_id, char *msg, size_t msg_sz) {
+    int rc;
+    if (!title_id || !title_id[0]) {
+        snprintf(msg, msg_sz, "no title");
+        return -1;
+    }
+    backend_wait();
+    if (g_stage != 5 || !ai_uninstall) {
+        snprintf(msg, msg_sz, "uninstall not available: %s", stage_str(g_stage));
+        return -1;
+    }
+    rc = ai_uninstall(title_id);
+    snprintf(msg, msg_sz, rc ? "uninstall rc=0x%08x" : "uninstalled", (unsigned)rc);
     return rc;
 }

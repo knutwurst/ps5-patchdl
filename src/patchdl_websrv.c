@@ -48,6 +48,16 @@ static patchdl_fw_t     g_fw;
 static patchdl_title_t *g_titles;
 static size_t           g_title_count;
 static pthread_mutex_t  g_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* cancel/delete, new downloads and claiming a replace install take turns.
+   taken before g_mutex and g_pool.mtx */
+static pthread_mutex_t  g_cancel_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* games PatchDL is replacing: the console drops them from its list for a
+   while, PatchDL keeps showing them until they're back (or the pkg is
+   deleted), so the card stays and Install can try again. g_mutex */
+#define MAX_HELD 8
+static patchdl_title_t  g_held[MAX_HELD];
+static int              g_held_n;
+static void unhold_title_locked(const char *title_id);
 static char            *g_debug_json; /* built once at startup */
 /* version.xml thread, joinable so shutdown can wait for it
    before g_titles gets freed */
@@ -98,6 +108,7 @@ typedef struct {
     int       verified;    /* 1: installed and from this package, -1: not shown */
     int       deleted;     /* package removed after the check (setting on) */
     int       claiming;    /* an install request is starting it right now */
+    int       failed;      /* never got going (replace whose install failed) */
 } install_stream_t;
 
 #define MAX_STREAMS 8
@@ -166,6 +177,8 @@ stream_quiet_secs(const install_stream_t *st) {
 static const char *
 stream_phase(const install_stream_t *st, time_t now) {
     int read_all = stream_read_all(st);
+    if (st->failed) return "stalled";
+    if (st->claiming) return "waiting";   /* a replace may wait on the uninstall */
     if (!read_all && now - st->last >= INSTALL_STALL_SECS) return "stalled";
     if (!read_all) return st->read ? "reading" : "waiting";
     /* verified counts as done for the card, the pkg may wait a bit longer */
@@ -1872,12 +1885,16 @@ write_job_state(const dl_job_t *job) {
     bitmap_to_hex(job->bitmap, nbytes, hex, (size_t)nbytes * 2 + 1);
     f = fopen(tmp, "w");
     if (f) {
-        int listed = 0;
+        int    listed = 0;
+        jbuf_t nm = {0};
+        /* the name, so the Downloads list knows the game after it's deleted */
+        jbuf_append_str(&nm, job->name);
         fprintf(f,
-                "{\"manifest_url\":\"%s\",\"version\":\"%s\",\"total\":%lld,"
+                "{\"manifest_url\":\"%s\",\"version\":\"%s\",\"name\":%s,\"total\":%lld,"
                 "\"piece_count\":%d,\"done_bytes\":%lld,\"done\":\"%s\",\"have\":\"",
-                job->manifest_url, job->version, job->total, job->mf.count,
-                job->done_bytes, hex);
+                job->manifest_url, job->version, nm.buf ? nm.buf : "\"\"", job->total,
+                job->mf.count, job->done_bytes, hex);
+        free(nm.buf);
         /* piece:bytes of started pieces, synced bytes only */
         for (int i = 0; job->ps && i < job->mf.count && listed < SIDECAR_MAX_HAVE; i++)
             if (job->ps[i].state != PC_DONE && job->ps[i].have > 0)
@@ -2528,9 +2545,26 @@ dl_worker(void *arg) {
 
 /* 202 right away, the pool does the rest. a paused job resumes */
 static enum MHD_Result
+do_download_locked(struct MHD_Connection *conn, const char *title_id,
+                   patchdl_source_t src, const char *patch_url, const char *delta_url,
+                   const char *name, const char *version, int enabled);
+
+/* a new job would rewrite the pkg a replace install is about to use */
+static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
             patchdl_source_t src, const char *patch_url, const char *delta_url,
             const char *name, const char *version, int enabled) {
+    enum MHD_Result r;
+    pthread_mutex_lock(&g_cancel_mtx);
+    r = do_download_locked(conn, title_id, src, patch_url, delta_url, name, version, enabled);
+    pthread_mutex_unlock(&g_cancel_mtx);
+    return r;
+}
+
+static enum MHD_Result
+do_download_locked(struct MHD_Connection *conn, const char *title_id,
+                   patchdl_source_t src, const char *patch_url, const char *delta_url,
+                   const char *name, const char *version, int enabled) {
     dl_job_t *job, *existing = NULL;
     int       count = 0, verify;
 
@@ -2674,10 +2708,18 @@ static void cancel_title(const char *title_id);
 
 static enum MHD_Result
 do_cancel(struct MHD_Connection *conn, const char *title_id) {
-    if (install_reading(title_id))
+    pthread_mutex_lock(&g_cancel_mtx);
+    if (install_reading(title_id)) {
+        pthread_mutex_unlock(&g_cancel_mtx);
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"install_running\"}");
+    }
     cancel_title(title_id);
+    pthread_mutex_lock(&g_mutex);
+    unhold_title_locked(title_id);      /* no pkg, nothing left to show */
+    pthread_mutex_unlock(&g_mutex);
+    g_scan_now = 1;                     /* and drop its card from the list */
+    pthread_mutex_unlock(&g_cancel_mtx);
     return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"cancelled\":true}");
 }
 
@@ -2805,6 +2847,7 @@ build_storage_json(void) {
                 fclose(vf);
                 buf[n] = '\0';
                 json_get_str(buf, "version", ver, sizeof ver);
+                json_get_str(buf, "name", name, sizeof name);
             }
             if (!ver[0]) {
                 manual_source_path(de->d_name, path, sizeof path);
@@ -3045,15 +3088,453 @@ queue_netcheck_title(struct MHD_Connection *conn, const char *tid) {
     return queue_json_owned(conn, MHD_HTTP_OK, out);
 }
 
+/* which base game a PS5 package builds on. the console only takes an update
+   whose base matches the installed game's, a disc build can differ (#20) */
+typedef struct { char content[16]; char master[8]; } pkg_origin_t;
+
+/* top-level "key": "value" in [p, end), the metadata is pretty-printed */
+static int
+doc_field(const char *p, const char *end, const char *key, char *out, size_t sz) {
+    char   needle[48];
+    size_t nl;
+    snprintf(needle, sizeof needle, "\n  \"%s\": \"", key);
+    nl = strlen(needle);
+    for (const char *q = p; q + nl < end; q++) {
+        const char *v;
+        size_t      n = 0;
+        if (memcmp(q, needle, nl)) continue;
+        v = q + nl;
+        while (v + n < end && v[n] != '"' && n < sz - 1) n++;
+        if (v + n >= end || v[n] != '"') return -1;
+        memcpy(out, v, n);
+        out[n] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+/* from the start of the _sc part: param.json, then origin-param.json. a
+   package without originContentVersion is its own base */
+static int
+origin_from_block(const char *b, size_t n, pkg_origin_t *o) {
+    const char *end = b + n, *p = b;
+    int         doc = 0;
+    memset(o, 0, sizeof *o);
+    while (p < end) {
+        const char *s = NULL, *e = NULL;
+        char        cv[16] = "", mv[8] = "", ov[16] = "";
+        /* "{", a newline (CRLF in Sony's files) and an indented key */
+        for (const char *q = p; q + 5 < end; q++) {
+            const char *k = q + 1;
+            if (q[0] != '{') continue;
+            if (*k == '\r') k++;
+            if (k + 3 < end && k[0] == '\n' && k[1] == ' ' && k[2] == ' ' && k[3] == '"') {
+                s = q;
+                break;
+            }
+        }
+        if (!s) break;
+        for (const char *q = s; q + 1 < end; q++)
+            if (q[0] == '\n' && q[1] == '}') { e = q + 2; break; }
+        if (!e) break;
+        p = e;
+        if (doc_field(s, e, "contentVersion", cv, sizeof cv)) continue;
+        doc_field(s, e, "masterVersion", mv, sizeof mv);
+        doc_field(s, e, "originContentVersion", ov, sizeof ov);
+        if (doc++ == 0 && ov[0]) continue;   /* a patch's param.json, base comes next */
+        if (ov[0]) continue;                   /* target-param.json */
+        snprintf(o->content, sizeof o->content, "%s", cv);
+        snprintf(o->master, sizeof o->master, "%s", mv);
+        return mv[0] ? 0 : -1;
+    }
+    return -1;
+}
+
+static const char *
+find_in(const char *p, const char *end, const char *needle) {
+    size_t nl = strlen(needle);
+    for (; p + nl <= end; p++)
+        if (!memcmp(p, needle, nl)) return p;
+    return NULL;
+}
+
+/* where the _sc part starts, from app.json or a manifest: the piece named
+   *_sc.pkg, else the last piece of several. -1 for a single-piece install */
+static long long
+sc_offset_from_json(const char *j) {
+    const char *a = strstr(j, "\"pieces\""), *z, *p;
+    long long   last = -1, sc = -1;
+    int         pieces = 0;
+    if (!a || !(a = strchr(a, '['))) return -1;
+    z = strchr(a, ']');
+    for (p = a; (p = strchr(p, '{')) && (!z || p < z); ) {
+        const char *e = strchr(p, '}'), *f, *u;
+        if (!e) break;
+        if ((f = find_in(p, e, "\"fileOffset\":"))) {
+            long long off = strtoll(f + 13, NULL, 10);
+            pieces++;
+            last = off;
+            if ((u = find_in(p, e, "_sc.pkg\"")) && u > p) sc = off;
+        }
+        p = e + 1;
+    }
+    return sc >= 0 ? sc : pieces > 1 ? last : -1;
+}
+
+#define ORIGIN_BLOCK (64 * 1024)
+#define APP_JSON_MAX (256 * 1024)
+
+static int
+installed_origin(const char *title_id, pkg_origin_t *o) {
+    char     *aj = malloc(APP_JSON_MAX), *blk = malloc(ORIGIN_BLOCK);
+    long long off;
+    ssize_t   n;
+    int       rc = -1;
+    if (aj && blk && patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX) == 0 &&
+        (off = sc_offset_from_json(aj)) >= 0 &&
+        (n = patchdl_scan_read_app_range(title_id, "app.pkg", off, blk, ORIGIN_BLOCK)) > 0)
+        rc = origin_from_block(blk, (size_t)n, o);
+    free(aj);
+    free(blk);
+    return rc;
+}
+
+/* the downloaded pkg, through the local manifest next to it */
+static int
+package_origin(const char *dest, pkg_origin_t *o) {
+    char      path[360], *mj = malloc(APP_JSON_MAX), *blk = malloc(ORIGIN_BLOCK);
+    size_t    n = strlen(dest), got;
+    long long off;
+    ssize_t   r;
+    FILE     *f;
+    int       fd, rc = -1;
+    if (!mj || !blk || n < 5 || strcmp(dest + n - 4, ".pkg")) goto out;
+    snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
+    if (!(f = fopen(path, "r"))) goto out;
+    got = fread(mj, 1, APP_JSON_MAX - 1, f);
+    fclose(f);
+    mj[got] = '\0';
+    if ((off = sc_offset_from_json(mj)) < 0 || (fd = open(dest, O_RDONLY)) < 0) goto out;
+    r = pread(fd, blk, ORIGIN_BLOCK, (off_t)off);
+    close(fd);
+    if (r > 0) rc = origin_from_block(blk, (size_t)r, o);
+out:
+    free(mj);
+    free(blk);
+    return rc;
+}
+
+/* 1 fits, 0 needs a fresh install, -1 can't tell (then it's tried as usual) */
+static int
+update_fits_installed(const char *title_id, const char *dest) {
+    pkg_origin_t inst, pkg;
+    if (installed_origin(title_id, &inst) || package_origin(dest, &pkg)) return -1;
+    return !strcmp(inst.content, pkg.content) && !strcmp(inst.master, pkg.master);
+}
+
+/* claim the title's install entry, one per title so a second tab or a double
+   click can't start it twice. NULL with *out set, else the reason */
+static const char *
+claim_install(const char *title_id, const char *dest, const char *version,
+              int fresh, install_stream_t **out) {
+    struct stat       pst;
+    const char       *base = strrchr(dest, '/');
+    const char       *reason = NULL;
+    time_t            now = time(NULL);
+    install_stream_t *st;
+
+    pthread_mutex_lock(&g_mutex);
+    st = stream_find(title_id);
+    if (st) {
+        int given_up = !strcmp(stream_phase(st, now), "stalled");
+        if (st->claiming || (!st->checked && !given_up))
+            reason = "install_running";
+        else if (!fresh && st->verified > 0 && !strcmp(st->version, version))
+            reason = "already_installed";   /* a fresh install: the game is gone */
+    } else {
+        /* a free entry, else the oldest finished one */
+        for (int i = 0; i < MAX_STREAMS && !st; i++)
+            if (!g_streams[i].title_id[0]) st = &g_streams[i];
+        for (int i = 0; i < MAX_STREAMS; i++) {
+            install_stream_t *c = &g_streams[i];
+            int over = c->checked || !strcmp(stream_phase(c, now), "stalled");
+            if (st && !st->title_id[0]) break;
+            if (!c->claiming && over && (!st || c->started < st->started))
+                st = c;
+        }
+        if (!st) reason = "too_many_installs";   /* never drop a live one */
+    }
+    if (!reason) {
+        memset(st, 0, sizeof *st);
+        snprintf(st->title_id, sizeof st->title_id, "%.9s", title_id);
+        st->total    = stat(dest, &pst) == 0 ? (long long)pst.st_size : 0;
+        st->started  = st->last = now;
+        st->claiming = 1;
+        snprintf(st->version, sizeof st->version, "%s", version);
+        snprintf(st->file, sizeof st->file, "%s", base ? base + 1 : dest);
+        *out = st;
+    }
+    pthread_mutex_unlock(&g_mutex);
+    return reason;
+}
+
+static void
+release_claim(install_stream_t *st) {
+    pthread_mutex_lock(&g_mutex);
+    memset(st, 0, sizeof *st);
+    pthread_mutex_unlock(&g_mutex);
+}
+
+/* hand dest to the installer under an existing claim */
+static enum MHD_Result
+launch_install(struct MHD_Connection *conn, install_stream_t *st, const char *title_id,
+               const char *dest, const char *content_id, const char *name) {
+    char msg[256], resp[720];
+    int  rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, name,
+                                        msg, sizeof(msg));
+    pthread_mutex_lock(&g_mutex);
+    if (rc == 0) {
+        st->claiming = 0;
+        st->started  = st->last = time(NULL);
+    } else {
+        memset(st, 0, sizeof *st);   /* nothing started, release */
+    }
+    pthread_mutex_unlock(&g_mutex);
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\",\"path\":\"%s\"}",
+             rc == 0 ? "true" : "false", rc, msg, dest);
+    return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
+                            strdup(resp));
+}
+
+static enum MHD_Result
+start_install(struct MHD_Connection *conn, const char *title_id, const char *dest,
+              const char *version, const char *content_id, const char *name) {
+    install_stream_t *st = NULL;
+    const char       *reason = claim_install(title_id, dest, version, 0, &st);
+    char              resp[96];
+    if (reason) {
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}", reason);
+        return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+    }
+    return launch_install(conn, st, title_id, dest, content_id, name);
+}
+
+/* g_mutex held */
+static void
+hold_title_locked(const char *title_id) {
+    for (int i = 0; i < g_held_n; i++)
+        if (!strcmp(g_held[i].title_id, title_id)) return;
+    if (g_held_n == MAX_HELD) return;
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            g_held[g_held_n] = g_titles[i];
+            /* the icon file goes with the game, an open fd keeps it readable */
+            g_held[g_held_n].icon_fd = g_titles[i].icon_fd >= 0 ? dup(g_titles[i].icon_fd) : -1;
+            g_held_n++;
+            return;
+        }
+}
+
+/* g_mutex held */
+static void
+unhold_title_locked(const char *title_id) {
+    for (int i = 0; i < g_held_n; i++)
+        if (!strcmp(g_held[i].title_id, title_id)) {
+            if (g_held[i].icon_fd >= 0) close(g_held[i].icon_fd);
+            g_held[i] = g_held[--g_held_n];
+            return;
+        }
+}
+
+typedef struct {
+    char              tid[16], dest[320], cid[64], name[128];
+    install_stream_t *claim;
+} replace_job_t;
+
+/* the uninstall takes /user/appmeta along, but the pkg has its own cover:
+   entry 0x1200 (icon0.png) of the _sc piece. put it next to the pkg for the
+   installer's notification and Downloads entry */
+static void
+cover_from_pkg(const char *dest) {
+    char          path[360], *mj = malloc(APP_JSON_MAX), *buf = NULL;
+    unsigned char *hd = malloc(ORIGIN_BLOCK);
+    size_t        n = strlen(dest), got;
+    long long     off;
+    uint32_t      cnt, tbl, eoff = 0, esz = 0;
+    FILE         *f;
+    int           fd = -1, out;
+
+    if (!mj || !hd || n < 5 || strcmp(dest + n - 4, ".pkg") || !strrchr(dest, '/')) goto out;
+    snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
+    if (!(f = fopen(path, "r"))) goto out;
+    got = fread(mj, 1, APP_JSON_MAX - 1, f);
+    fclose(f);
+    mj[got] = '\0';
+    snprintf(path, sizeof path, "%.*s/icon0.png", (int)(strrchr(dest, '/') - dest), dest);
+    unlink(path);   /* no cover beats the one of an older pkg */
+    if ((off = sc_offset_from_json(mj)) < 0 || (fd = open(dest, O_RDONLY)) < 0) goto out;
+    if (pread(fd, hd, ORIGIN_BLOCK, (off_t)off) != ORIGIN_BLOCK || memcmp(hd, "\x7f" "CNT", 4))
+        goto out;
+#define BE32(p) ((uint32_t)(p)[0] << 24 | (uint32_t)(p)[1] << 16 | (uint32_t)(p)[2] << 8 | (p)[3])
+    cnt = BE32(hd + 0x10);
+    tbl = BE32(hd + 0x18);
+    for (uint32_t i = 0; i < cnt && tbl + 32ULL * (i + 1) <= ORIGIN_BLOCK; i++)
+        if (BE32(hd + tbl + 32 * i) == 0x1200) {
+            eoff = BE32(hd + tbl + 32 * i + 16);
+            esz  = BE32(hd + tbl + 32 * i + 20);
+            break;
+        }
+#undef BE32
+    if (esz < 64 || esz > 8 << 20 || !(buf = malloc(esz))) goto out;
+    /* whole png: signature up front, IEND chunk at the very end */
+    if (pread(fd, buf, esz, (off_t)(off + eoff)) != (ssize_t)esz ||
+        memcmp(buf, "\x89PNG\r\n\x1a\n", 8) || memcmp(buf + esz - 8, "IEND", 4))
+        goto out;
+    if ((out = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0666)) >= 0) {
+        if (write(out, buf, esz) != (ssize_t)esz) unlink(path);
+        close(out);
+    }
+out:
+    if (fd >= 0) close(fd);
+    free(buf);
+    free(hd);
+    free(mj);
+}
+
+/* runs under the claim: uninstall, wait for the console to let go of the
+   title however long it takes, then the fresh install. a failure ends the
+   claim as "stalled", so the card says so instead of waiting forever */
+static void *
+replace_thread(void *arg) {
+    replace_job_t *job = arg;
+    char           msg[256], *aj = malloc(4096);
+    int            rc = -1, gone = 0;
+
+    cover_from_pkg(job->dest);
+    if (aj && patchdl_install_uninstall(job->tid, msg, sizeof msg) == 0) {
+        /* the installer refuses a title that is still half there */
+        for (int i = 0; i < 30 * 60 && !gone; i++) {
+            gone = patchdl_scan_read_app_file(job->tid, "app.json", aj, 4096) != 0;
+            if (!gone) sleep(1);
+        }
+        if (gone)
+            rc = patchdl_install_local_pkg(job->dest, job->tid, NULL, job->cid,
+                                           job->name[0] ? job->name : NULL,
+                                           msg, sizeof msg);
+    }
+    free(aj);
+    pthread_mutex_lock(&g_mutex);
+    job->claim->claiming = 0;
+    job->claim->started  = job->claim->last = time(NULL);
+    if (rc != 0) {
+        job->claim->failed  = 1;
+        job->claim->checked = 1;
+    }
+    pthread_mutex_unlock(&g_mutex);
+    free(job);
+    return NULL;
+}
+
+/* the update builds on another base than the installed game: take the game
+   off and put the update on as the whole game. PS5 updates carry all of it,
+   saves stay, a disc game keeps using its disc as the license. only after
+   the user said yes to it */
+static enum MHD_Result
+do_replace_install(struct MHD_Connection *conn, const char *title_id,
+                   const char *dest, const char *version, const char *name,
+                   const char *game_dir, int force) {
+    char              ecid[64] = "", etid[48] = "", msg[128], resp[320], tag[16];
+    char             *aj;
+    const char       *reason;
+    int               is_app = 0;
+    struct stat       st;
+    install_stream_t *claim = NULL;
+    replace_job_t    *job;
+    pthread_t         th;
+
+    /* nothing goes on as this game unless the pkg says it is this game */
+    if (patchdl_install_pkg_meta(dest, ecid, sizeof ecid, etid, sizeof etid,
+                                 &is_app, msg, sizeof msg) != 0 || !ecid[0])
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"pkg_unreadable\"}");
+    snprintf(tag, sizeof tag, "-%.9s_", title_id);
+    if (!strstr(ecid, tag))
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"pkg_title_mismatch\"}");
+
+    /* the old game's room comes back before the new one goes on */
+    if (!force && stat(dest, &st) == 0) {
+        long long need = (long long)st.st_size + INSTALL_SPACE_MARGIN;
+        long long free_b = game_free_bytes(game_dir);
+        char      size_s[24] = "";
+        aj = malloc(APP_JSON_MAX);
+        if (aj && patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX) == 0) {
+            const char *k = strstr(aj, "\"originalFileSize\":");
+            if (k) snprintf(size_s, sizeof size_s, "%.20s", k + 19);
+        }
+        free(aj);
+        if (free_b >= 0) free_b += strtoll(size_s, NULL, 10);
+        if (free_b >= 0 && free_b < need) {
+            snprintf(resp, sizeof resp,
+                     "{\"ok\":false,\"reason\":\"install_space\","
+                     "\"need_bytes\":%lld,\"free_bytes\":%lld}", need, free_b);
+            return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+        }
+    }
+
+    /* claim the install slot and look at the pkg once more, with cancels and
+       new downloads held off: no slot or no pkg, no uninstall. from then on
+       the claim keeps both away until the installer has it */
+    pthread_mutex_lock(&g_cancel_mtx);
+    if ((reason = claim_install(title_id, dest, version, 1, &claim))) {
+        pthread_mutex_unlock(&g_cancel_mtx);
+        snprintf(resp, sizeof resp, "{\"ok\":false,\"reason\":\"%s\"}", reason);
+        return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+    }
+    {
+        char   jpath[360];
+        size_t dl = strlen(dest);
+        snprintf(jpath, sizeof jpath, "%.*s.json", (int)(dl > 4 ? dl - 4 : dl), dest);
+        if (stat(dest, &st) != 0 || st.st_size != claim->total || claim->total <= 0 ||
+            stat(jpath, &st) != 0 || !download_complete(title_id)) {
+            release_claim(claim);
+            pthread_mutex_unlock(&g_cancel_mtx);
+            return queue_json(conn, MHD_HTTP_CONFLICT,
+                              "{\"ok\":false,\"reason\":\"download_incomplete\"}");
+        }
+    }
+    pthread_mutex_lock(&g_mutex);
+    hold_title_locked(title_id);
+    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_unlock(&g_cancel_mtx);
+
+    if (!(job = calloc(1, sizeof *job))) {
+        release_claim(claim);
+        return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
+    }
+    snprintf(job->tid, sizeof job->tid, "%.9s", title_id);
+    snprintf(job->dest, sizeof job->dest, "%s", dest);
+    snprintf(job->cid, sizeof job->cid, "%s", ecid);
+    snprintf(job->name, sizeof job->name, "%s", name ? name : "");
+    job->claim = claim;
+    if (pthread_create(&th, NULL, replace_thread, job)) {
+        free(job);
+        release_claim(claim);
+        return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "no thread");
+    }
+    pthread_detach(th);
+    /* the card follows it through the install status from here */
+    return queue_json(conn, MHD_HTTP_ACCEPTED, "{\"ok\":true,\"replacing\":true}");
+}
+
 static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
            patchdl_source_t src, const char *patch_url, const char *delta_url,
            const char *patch_title_id, const char *patch_storage_title_id,
            const char *content_id, const char *name, const char *version,
-           int enabled, int force) {
-    char              dest[320], msg[256], resp[720];
-    int               rc;
-    install_stream_t *st = NULL;
+           int enabled, int force, int replace) {
+    char dest[320], resp[720];
 
     if (!enabled)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
@@ -3080,6 +3561,26 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         return queue_json(conn, MHD_HTTP_CONFLICT, stat(dest, &pst) == 0
                           ? "{\"ok\":false,\"reason\":\"download_unverified\"}"
                           : "{\"ok\":false,\"reason\":\"download_incomplete\"}");
+    }
+
+    /* PS5: an update on another base than the installed game is turned down
+       by the console, it only goes on as the whole game. ask first */
+    if (strncmp(title_id, "CUSA", 4) && url_is_manifest(patch_url)) {
+        title_pkg_path(title_id, patch_url, dest, sizeof(dest));
+        if (update_fits_installed(title_id, dest) == 0) {
+            char gdir[256] = "";
+            if (!replace)
+                return queue_json(conn, MHD_HTTP_CONFLICT,
+                                  "{\"ok\":false,\"reason\":\"needs_reinstall\"}");
+            pthread_mutex_lock(&g_mutex);
+            for (size_t i = 0; i < g_title_count; i++)
+                if (!strcmp(g_titles[i].title_id, title_id)) {
+                    snprintf(gdir, sizeof gdir, "%s", g_titles[i].source_path);
+                    break;
+                }
+            pthread_mutex_unlock(&g_mutex);
+            return do_replace_install(conn, title_id, dest, version, name, gdir, force);
+        }
     }
 
     /* the update lands next to the game and needs about the pkg size free
@@ -3121,66 +3622,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
        AppInstallPkg only writes metadata, so InstallByPackage via /api/pkg */
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    /* check and claim in one go, so a second tab or a double click can't
-       start it twice */
-    {
-        struct stat pst;
-        const char *base = strrchr(dest, '/');
-        const char *reason = NULL;
-        time_t      now = time(NULL);
-
-        pthread_mutex_lock(&g_mutex);
-        st = stream_find(title_id);
-        if (st) {
-            int given_up = !strcmp(stream_phase(st, now), "stalled");
-            if (st->claiming || (!st->checked && !given_up))
-                reason = "install_running";
-            else if (st->verified > 0 && !strcmp(st->version, version))
-                reason = "already_installed";
-        } else {
-            /* a free entry, else the oldest finished one */
-            for (int i = 0; i < MAX_STREAMS && !st; i++)
-                if (!g_streams[i].title_id[0]) st = &g_streams[i];
-            for (int i = 0; i < MAX_STREAMS; i++) {
-                install_stream_t *c = &g_streams[i];
-                int over = c->checked || !strcmp(stream_phase(c, now), "stalled");
-                if (st && !st->title_id[0]) break;
-                if (!c->claiming && over && (!st || c->started < st->started))
-                    st = c;
-            }
-            if (!st) reason = "too_many_installs";   /* never drop a live one */
-        }
-        if (!reason) {
-            memset(st, 0, sizeof *st);
-            snprintf(st->title_id, sizeof st->title_id, "%.9s", title_id);
-            st->total    = stat(dest, &pst) == 0 ? (long long)pst.st_size : 0;
-            st->started  = st->last = now;
-            st->claiming = 1;
-            snprintf(st->version, sizeof st->version, "%s", version);
-            snprintf(st->file, sizeof st->file, "%s", base ? base + 1 : dest);
-        }
-        pthread_mutex_unlock(&g_mutex);
-        if (reason) {
-            snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}", reason);
-            return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
-        }
-    }
-
-    rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, name,
-                                   msg, sizeof(msg));
-    pthread_mutex_lock(&g_mutex);
-    if (rc == 0) {
-        st->claiming = 0;
-        st->started  = st->last = time(NULL);
-    } else {
-        memset(st, 0, sizeof *st);   /* nothing started, release */
-    }
-    pthread_mutex_unlock(&g_mutex);
-    snprintf(resp, sizeof(resp),
-             "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\",\"path\":\"%s\"}",
-             rc == 0 ? "true" : "false", rc, msg, dest);
-    return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
-                            strdup(resp));
+    return start_install(conn, title_id, dest, version, content_id, name);
 }
 
 /* Prospero link to Sony's manifest (<name>.json next to <name>_sc.pkg
@@ -3476,10 +3918,11 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
 
     if (!strcmp(action, "install")) {
         const char *f = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "force");
+        const char *r = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "replace");
         return do_install(conn, title_id, src, patch_url, delta_url,
                           patch_title_id, patch_storage_title_id,
                           content_id, name, version, enabled,
-                          f && !strcmp(f, "1"));
+                          f && !strcmp(f, "1"), r && !strcmp(r, "1"));
     }
 
     return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
@@ -4102,6 +4545,28 @@ rescan_titles(int recheck) {
     t2 = mono_ms();
     g_rescan_step = "swap";
     pthread_mutex_lock(&g_mutex);
+    /* held games: back in the console's list ends the hold, else they stay */
+    for (int h = 0; h < g_held_n; ) {
+        const install_stream_t *st = stream_find(g_held[h].title_id);
+        int back = 0;
+        /* while the replace still holds its claim, a listed game can be the
+           old install the scan caught before the uninstall */
+        for (size_t i = 0; i < cnt && !back && !(st && st->claiming); i++)
+            back = !strcmp(arr[i].title_id, g_held[h].title_id);
+        if (back) { unhold_title_locked(g_held[h].title_id); continue; }
+        h++;
+    }
+    if (g_held_n) {
+        patchdl_title_t *grown = realloc(arr, (cnt + (size_t)g_held_n) * sizeof *arr);
+        if (grown) {
+            arr = grown;
+            for (int h = 0; h < g_held_n; h++) {
+                arr[cnt] = g_held[h];
+                arr[cnt].icon_fd = g_held[h].icon_fd >= 0 ? dup(g_held[h].icon_fd) : -1;
+                cnt++;
+            }
+        }
+    }
     for (size_t i = 0; i < cnt; i++)
         for (size_t k = 0; k < g_title_count; k++)
             if (!strcmp(arr[i].title_id, g_titles[k].title_id)) {

@@ -51,3 +51,7 @@ int patchdl_install_app_pkg(const char *local_path,
                              const char *expected_title_id,
                              const char *target_content_id,
                              char *msg, size_t msg_sz);
+
+/* removes an installed app, saves stay. only for replacing a game with its
+   full update package, never on a hunch */
+int patchdl_install_uninstall(const char *title_id, char *msg, size_t msg_sz);
