@@ -799,13 +799,19 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     title_id[len] = '\0';
 
     rest = slash + 1;
-    if (*rest >= '0' && *rest <= '9') {
-        char *e1, *e2;
-        win_off  = strtoull(rest, &e1, 10);
-        win_size = *e1 == '/' ? strtoull(e1 + 1, &e2, 10) : 0;
-        if (*e1 != '/' || !win_size || *e2 != '/' || !e2[1])
-            return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
-        rest = e2 + 1;
+    /* <digits>/<digits>/<file> is a piece, anything else a plain file name */
+    {
+        const char *a = rest, *b;
+        while (*a >= '0' && *a <= '9') a++;
+        b = (a > rest && *a == '/') ? a + 1 : NULL;
+        if (b) { while (*b >= '0' && *b <= '9') b++; }
+        if (b && b > a + 1 && *b == '/' && b[1]) {
+            win_off  = strtoull(rest, NULL, 10);
+            win_size = strtoull(a + 1, NULL, 10);
+            if (!win_size)
+                return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+            rest = b + 1;
+        }
     }
     len = strlen(rest);
     if (len >= sizeof(file))
@@ -2068,7 +2074,7 @@ static void
 write_local_manifest(const char *dest, const char *title_id,
                      const patchdl_manifest_t *mf) {
     const char *file = strrchr(dest, '/');
-    size_t      n = strlen(dest), stem;
+    size_t      n = strlen(dest);
     char        path[340], tmp[352];
     jbuf_t      j = {0};
     FILE       *fp;
@@ -2076,27 +2082,42 @@ write_local_manifest(const char *dest, const char *title_id,
     if (!file || n < 5 || strcmp(dest + n - 4, ".pkg") || !strncmp(title_id, "CUSA", 4))
         return;                             /* PS4 never tried this way */
     file++;
-    stem = strlen(file) - 4;
     snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
 
+    /* jbuf_appendf stops at 256 bytes, so names and hashes go in whole */
     jbuf_appendf(&j, "{\"originalFileSize\":%lld,\"numberOfSplitFiles\":%d,",
                  mf->total, mf->count);
-    if (hex_only(mf->digest))
-        jbuf_appendf(&j, "\"packageDigest\":\"%s\",", mf->digest);
-    if (mf->crc_url[0] && hex_only(mf->crc_hash))
-        jbuf_appendf(&j, "\"playgoChunkCrcHashValue\":\"%s\","
-                     "\"playgoChunkCrcUrl\":\"http://127.0.0.1:%d/api/pkg/%s/%.*s.crc\",",
-                     mf->crc_hash, PATCHDL_HTTP_PORT, title_id, (int)stem, file);
+    if (hex_only(mf->digest)) {
+        jbuf_append(&j, "\"packageDigest\":\"");
+        jbuf_append(&j, mf->digest);
+        jbuf_append(&j, "\",");
+    }
+    if (mf->crc_url[0] && hex_only(mf->crc_hash)) {
+        jbuf_append(&j, "\"playgoChunkCrcHashValue\":\"");
+        jbuf_append(&j, mf->crc_hash);
+        jbuf_appendf(&j, "\",\"playgoChunkCrcUrl\":\"http://127.0.0.1:%d/api/pkg/",
+                     PATCHDL_HTTP_PORT);
+        jbuf_append(&j, title_id);
+        jbuf_append(&j, "/");
+        jbuf_append(&j, file);
+        if (j.buf && j.len >= 4) j.len -= 4;   /* drop ".pkg" */
+        jbuf_append(&j, ".crc\",");
+    }
     jbuf_append(&j, "\"pieces\":[");
     for (int i = 0; i < mf->count; i++) {
-        jbuf_appendf(&j, "%s{\"url\":\"http://127.0.0.1:%d/api/pkg/%s/%lld/%lld/%s\","
-                     "\"fileOffset\":%lld,\"fileSize\":%lld",
-                     i ? "," : "", PATCHDL_HTTP_PORT, title_id,
-                     mf->pieces[i].offset, mf->pieces[i].size, file,
+        jbuf_appendf(&j, "%s{\"url\":\"http://127.0.0.1:%d/api/pkg/",
+                     i ? "," : "", PATCHDL_HTTP_PORT);
+        jbuf_append(&j, title_id);
+        jbuf_appendf(&j, "/%lld/%lld/", mf->pieces[i].offset, mf->pieces[i].size);
+        jbuf_append(&j, file);
+        jbuf_appendf(&j, "\",\"fileOffset\":%lld,\"fileSize\":%lld",
                      mf->pieces[i].offset, mf->pieces[i].size);
-        if (hex_only(mf->pieces[i].hash))
-            jbuf_appendf(&j, ",\"hashValue\":\"%s\"", mf->pieces[i].hash);
+        if (hex_only(mf->pieces[i].hash)) {
+            jbuf_append(&j, ",\"hashValue\":\"");
+            jbuf_append(&j, mf->pieces[i].hash);
+            jbuf_append(&j, "\"");
+        }
         jbuf_append(&j, "}");
     }
     jbuf_append(&j, "]}");
