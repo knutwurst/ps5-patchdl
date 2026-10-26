@@ -3384,9 +3384,14 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
         return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
     }
 
+    patchdl_links_put(tid, ver, canon);
+    /* do_download says no to an installed version too, but only after the
+       manual source would have left a stray folder behind */
+    if (version_installed(tid, ver))
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"already_installed\"}");
     save_manual_source(tid, canon, ver);
     set_manual_source(tid, canon, ver);
-    patchdl_links_put(tid, ver, canon);
     return do_download(conn, tid, src, canon, "", tname, ver, en);
 }
 
