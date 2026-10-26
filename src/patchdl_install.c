@@ -612,6 +612,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         char              http_loop_uri[1200] = {0};
         char              http_lan_uri[1200] = {0};
         char              json_loop_uri[1200] = {0};
+        char              icon[64];
         const char       *uris[5];
         ai_meta_info_t    meta    = {0};
         ai_pkg_info_t     pkg     = {0};
@@ -673,9 +674,12 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         meta.playgo_scenario_id = "";
         /* empty like etaHEN's DPI, the installer takes the pkg's own id */
         meta.content_id         = "";
-        /* Downloads shows this, the console adds version and "update" itself */
+        /* name and picture of the notification. Downloads finds the cover
+           by itself, the notification only shows what we pass here */
         meta.content_name       = name && name[0] ? name : "PatchDL";
-        meta.icon_url           = "";
+        snprintf(icon, sizeof icon, "/user/appmeta/%.9s/icon0.png",
+                 expected_title_id ? expected_title_id : "");
+        meta.icon_url           = stat(icon, &st) == 0 ? icon : "";
 
         {
             char        tries[260] = {0};
