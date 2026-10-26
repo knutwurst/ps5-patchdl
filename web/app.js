@@ -247,7 +247,8 @@ async function openVersions(titleId) {
     <p class="sheet-source">${t("versions.source", { site: `<a href="${escapeHtml(data.page)}" target="_blank" rel="noopener">${escapeHtml(data.site)}${icon("external")}</a>` })}</p>`;
   body.querySelectorAll("[data-pick]").forEach((btn) => btn.addEventListener("click", () => {
     close();
-    openGuide(game, false, pickFor(game, btn.dataset.pick, btn.dataset.size));
+    if (hasSavedLink(game, btn.dataset.pick)) savedDownload(game, btn.dataset.pick, btn.dataset.size);
+    else openGuide(game, false, pickFor(game, btn.dataset.pick, btn.dataset.size));
   }));
   const first = body.querySelector("[data-pick]");
   if (first) first.focus();
@@ -687,6 +688,15 @@ function hasOlderPatch(game) {
     game.prospero_version > (game.installed_version || "");
 }
 
+// a link pasted before for this version, PatchDL keeps them
+function hasSavedLink(game, version) {
+  return Boolean(version) && (game.saved_versions || []).includes(version);
+}
+
+function rememberLink(game, version) {
+  if (!hasSavedLink(game, version)) game.saved_versions = [...(game.saved_versions || []), version];
+}
+
 function matchesFilter(game) {
   if (state.filter === "all") return true;
   return gameCategory(game) === state.filter;
@@ -831,6 +841,8 @@ function primaryButton(game) {
   if (game.installing) return { label: t("btn.installing"), variant: "ghost", disabled: true };
   if (game.downloading) return { label: t("btn.pause"), action: "pause", variant: "pause", hint: t("btn.pauseHint") };
   if (game.patch_title_match === false) return null;
+  if (canGetOlderPatch(game) && hasSavedLink(game, game.prospero_version))
+    return { label: t("btn.download"), action: "saved", variant: "update", hint: t("btn.downloadHint") };
   if (canGetOlderPatch(game))
     return { label: t("btn.oldFw"), action: "guide", variant: "update", hint: t("btn.oldFwHint", { version: game.prospero_version }) };
   if (game.resumable && isDownloadAllowed(game))
@@ -900,7 +912,10 @@ function statusPill(game) {
   if (game.status === "blocked" || !sourcePolicy(game).allow_install)
     return `<span class="pill">${t("pill.notSupported")}</span>`;
   if (game.patch_title_match === false) return `<span class="pill blocked">${t("pill.titleMismatch")}</span>`;
-  if (game.manual_version || hasOlderPatch(game))
+  // the badge says "get a link first", with a link it's a normal update
+  if (game.manual_version || (hasOlderPatch(game) && hasSavedLink(game, game.prospero_version)))
+    return `<span class="pill ok">${t("pill.available")}</span>`;
+  if (hasOlderPatch(game))
     return `<span class="pill prospero">${t("pill.via", { site: isPs4(game) ? "Orbis" : "Prospero" })}</span>`;
   if (game.status === "available") return `<span class="pill ok">${t("pill.available")}</span>`;
   if (game.status === "incompatible_fw")
@@ -1547,6 +1562,7 @@ async function runTitleAction(titleId, action) {
   else if (action === "pause") await doPause(game);
   else if (action === "cancel") await cancelDownload(titleId);
   else if (action === "guide") openGuide(game);
+  else if (action === "saved") await savedDownload(game, game.prospero_version, game.prospero_size || "");
 }
 
 // only sends the signal, the next poll flips the card to paused
@@ -2093,6 +2109,7 @@ async function guideSubmit(url, force) {
     return;
   }
   guide.busy = false;
+  rememberLink(game, pick.version);
   manualDownloadStarted(game, pick.version);
   if (!guide.fromLink) {
     showToast(t("toast.downloadStarted", { name: game.name, version: pick.version }));
@@ -2101,6 +2118,40 @@ async function guideSubmit(url, force) {
   }
   guide.started = true;
   guideStatus("ok", t("guide.started"));
+}
+
+// the server checks a saved link like a pasted one. a dead link gets dropped
+// and it's back to the browser
+async function savedDownload(game, version, size, force = false) {
+  if (!canPickVersion(game, version)) return;
+  try {
+    await postJson("/api/download_url", { title_id: game.title_id, version, size, saved: true, force });
+  } catch (error) {
+    const b = (error && error.body) || {};
+    const pick = pickFor(game, version, size);
+    if (b.reason === "no_space") {
+      showToast(noSpaceText(b.need_bytes, b.free_bytes));
+      return;
+    }
+    if (b.reason === "saved_link_gone") {
+      game.saved_versions = (game.saved_versions || []).filter((v) => v !== version);
+      showToast(t("toast.savedLinkGone", { site: pick.site }));
+      renderGames();
+      openGuide(game, false, pick);
+    } else if (b.reason === "size_mismatch" && !force) {
+      // same question as when the link was pasted, it was probably answered
+      // with "download anyway" back then
+      if (window.confirm(t("guide.sizeMismatch", {
+            found: formatBytes(b.found_bytes), pieces: Number(b.pieces) || "?",
+            version, expected: b.expected || "?" }) + "\n\n" + t("guide.downloadAnyway") + "?"))
+        return savedDownload(game, version, size, true);
+    } else {
+      showToast(t("toast.nameMessage", { name: game.name, message: reasonText(error) }));
+    }
+    return;
+  }
+  manualDownloadStarted(game, version);
+  showToast(t("toast.downloadStarted", { name: game.name, version }));
 }
 
 function manualDownloadStarted(game, version) {

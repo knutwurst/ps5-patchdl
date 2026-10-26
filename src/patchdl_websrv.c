@@ -14,6 +14,7 @@
 #include "patchdl_install.h"
 #include "patchdl_net.h"
 #include "patchdl_dns.h"
+#include "patchdl_links.h"
 #include "patchdl_resolve.h"
 #include "patchdl_tile.h"
 #include "patchdl_verxml.h"
@@ -1368,6 +1369,16 @@ build_titles_json(void) {
                      t->prospero_done ? "true" : "false");
         jbuf_append(&j, ",\"manual_version\":");
             jbuf_append_ver_or_null(&j, manual_pending(t) ? t->manual_version : "");
+        {
+            char vers[16][16];
+            int  nv = patchdl_links_versions(t->title_id, vers, 16);
+            jbuf_append(&j, ",\"saved_versions\":[");
+            for (int k = 0; k < nv; k++) {
+                if (k) jbuf_append(&j, ",");
+                jbuf_append_str(&j, vers[k]);
+            }
+            jbuf_append(&j, "]");
+        }
         jbuf_appendf(&j, ",\"enabled\":%s", t->enabled ? "true" : "false");
         jbuf_appendf(&j, ",\"resumable\":%s", t->resumable ? "true" : "false");
         jbuf_appendf(&j, ",\"partial_bytes\":%lld", t->partial_bytes);
@@ -3181,10 +3192,13 @@ manifest_from_link(const char *tid, const char *in, char *canon, size_t sz) {
     if (!strstr(base, tag))         return "url_title_mismatch";
 
     /* PS5 manifests over https with the pinned Sony root, PS4 ones only
-       exist over plain http on gs2 (PLAIN_HTTP_HOST) */
+       exist over plain http on gs2 (PLAIN_HTTP_HOST). goes by the host, a
+       saved PS4 link comes back as .json, not as a piece */
     if (sizeof("https://") - 1 + (size_t)(stem_end - rest) + sizeof(".json") > sz)
         return "url_too_long";
-    snprintf(canon, sz, "%s%.*s.json", ps4_piece ? "http://" : "https://",
+    snprintf(canon, sz, "%s%.*s.json",
+             ps4_piece || !strncmp(rest, "gs2.ww.prod.dl.playstation.net/", 31)
+                 ? "http://" : "https://",
              (int)(stem_end - rest), rest);
     return NULL;
 }
@@ -3239,14 +3253,20 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
     char             cid[64], tname[128], tv[16];
     const char      *p, *why;
     struct stat      st;
-    int              en = 0, busy = 0, pieces;
+    int              en = 0, busy = 0, pieces, saved;
     long long        found;
     patchdl_source_t src = PATCHDL_SOURCE_UNKNOWN;
 
     json_get_str(body, "title_id", tid, sizeof tid);
     json_get_str(body, "url", in, sizeof in);
     json_get_str(body, "version", ver, sizeof ver);
+    saved = json_get_bool(body, "saved", 0);
 
+    /* a link pasted before for this version, no browser needed */
+    if (saved && !in[0] && tid[0] && ver[0] &&
+        patchdl_links_get(tid, ver, in, sizeof in) != 0)
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+            "{\"ok\":false,\"reason\":\"saved_link_gone\"}");
     if (!tid[0] || !in[0] || !ver[0])
         return queue_json(conn, MHD_HTTP_BAD_REQUEST,
             "{\"ok\":false,\"reason\":\"title_id, url and version required\"}");
@@ -3258,6 +3278,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
             return queue_json(conn, MHD_HTTP_BAD_REQUEST,
                 "{\"ok\":false,\"reason\":\"version_invalid\"}");
     if ((why = manifest_from_link(tid, in, canon, sizeof canon))) {
+        if (saved) patchdl_links_drop(tid, ver);
         snprintf(resp, sizeof resp, "{\"ok\":false,\"reason\":\"%s\"}", why);
         return queue_json_owned(conn, MHD_HTTP_BAD_REQUEST, strdup(resp));
     }
@@ -3287,9 +3308,21 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
             "\"hint\":\"cancel the current download first\"}");
 
     /* fetch the manifest now so a dead link fails right away */
-    if (patchdl_fetch_manifest(canon, &mf) != 0)
+    if (patchdl_fetch_manifest(canon, &mf) != 0) {
+        char step[24] = "";
+        long code = 0;
+        patchdl_http_last_error(step, sizeof step, NULL, &code);
+        /* only a clear "not there" kills a saved link, 5xx and 429 pass */
+        if (saved && ((!strcmp(step, "http_status") &&
+                       (code == 403 || code == 404 || code == 410)) ||
+                      !strcmp(step, "bad_manifest"))) {
+            patchdl_links_drop(tid, ver);
+            return queue_json(conn, MHD_HTTP_CONFLICT,
+                "{\"ok\":false,\"reason\":\"saved_link_gone\"}");
+        }
         return queue_json(conn, MHD_HTTP_BAD_GATEWAY,
             "{\"ok\":false,\"reason\":\"manifest_unavailable\"}");
+    }
     found  = mf.total;
     pieces = mf.count;
     patchdl_manifest_free(&mf);
@@ -3316,6 +3349,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
 
     save_manual_source(tid, canon, ver);
     set_manual_source(tid, canon, ver);
+    patchdl_links_put(tid, ver, canon);
     return do_download(conn, tid, src, canon, "", tname, ver, en);
 }
 
@@ -4199,6 +4233,7 @@ patchdl_websrv_start(unsigned short port) {
         g_titles[i].enabled = (g_titles[i].source_type != PATCHDL_SOURCE_UNKNOWN) &&
                               !g_titles[i].sideloaded;
     load_config();
+    patchdl_links_load("/data/patchdl/links.tsv");
     /* a saved config can't switch a fake back on */
     for (size_t i = 0; i < g_title_count; i++)
         if (g_titles[i].source_type == PATCHDL_SOURCE_FAKE)
