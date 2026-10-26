@@ -97,6 +97,15 @@ const fallback = {
       patch_storage_match: true,
       mount_from: "/dev/ssd0.system_ex", enabled: true, status: "incompatible_fw",
     },
+    {
+      title_id: "PPSA01325", name: "ASTRO's PLAYROOM",
+      content_id: "IP9100-PPSA01325_00-PREINMASTER00000",
+      installed_version: null, compatible_version: "01.905.000",
+      latest_version: "01.905.000", latest_required_fw: "10.60",
+      source_type: "official", source_path: "", builtin: true,
+      patch_storage_match: true,
+      mount_from: "", enabled: true, status: "available",
+    },
   ],
   downloads: [],
   logs: [],
@@ -760,6 +769,7 @@ function createGameCard(game) {
       ${game.resumable && !game.downloading ? `<span class="pill warn">${t("pill.paused")}</span>` : ""}
       ${statusPill(game)}
       ${sourcePill(game)}
+      ${game.builtin ? `<span class="pill warn" title="${escapeHtml(t("pill.experimentalTitle"))}">${t("pill.experimental")}</span>` : ""}
       ${game.sideloaded ? `<span class="pill warn" title="${escapeHtml(t("pill.sideloadedTitle"))}">${t("pill.sideloaded")}</span>` : ""}
     </div>
     ${versionTrackHtml(game)}
@@ -861,9 +871,10 @@ function primaryButton(game) {
   if (game.downloaded && hasPatch) return null;
   if (!hasPatch) return null;
   if (!isDownloadAllowed(game)) return null;
+  const missing = isMissing(game);
   return state.config.install_after_download && isInstallAllowed(game)
-    ? { label: t("btn.update"), action: "update", variant: "update", hint: t("btn.updateHint") }
-    : { label: t("btn.download"), action: "download", variant: "update", hint: t("btn.downloadHint") };
+    ? { label: t(missing ? "btn.install" : "btn.update"), action: "update", variant: "update", hint: missing ? "" : t("btn.updateHint") }
+    : { label: t("btn.download"), action: "download", variant: "update", hint: missing ? "" : t("btn.downloadHint") };
 }
 
 // cancel deletes the partial, pause keeps it
@@ -876,20 +887,24 @@ function stopButton(game) {
   return null;
 }
 
+// offered although it isn't installed (Astro's Playroom)
+function isMissing(game) { return !game.installed_version; }
+
 function versionTrackHtml(game) {
   const step = (label, version, note, cls = "") => `
     <div class="vstep ${cls}"><span>${label}</span><b>${escapeHtml(version)}</b>${note ? `<em>${note}</em>` : ""}</div>`;
   const parts = [step(t("card.lblInstalled"), game.installed_version || "--", "")];
+  const target = t(isMissing(game) ? "card.lblInstall" : "card.lblUpdate");
   let offered = "";
   if (game.manual_version) {
     offered = game.manual_version;
-    parts.push(step(t("card.lblUpdate"), offered, "", "is-target"));
+    parts.push(step(target, offered, "", "is-target"));
   } else if (game.status === "available" && game.compatible_version) {
     offered = game.compatible_version;
-    parts.push(step(t("card.lblUpdate"), offered, "", "is-target"));
+    parts.push(step(target, offered, "", "is-target"));
   } else if (hasOlderPatch(game)) {
     offered = game.prospero_version;
-    parts.push(step(t("card.lblUpdate"), offered,
+    parts.push(step(target, offered,
       game.prospero_required_fw ? t("card.needsFw", { fw: escapeHtml(game.prospero_required_fw) }) : "", "is-target"));
   }
   if (game.latest_version && game.latest_version !== offered && game.latest_version !== game.installed_version)
@@ -921,6 +936,7 @@ function statusPill(game) {
     return `<span class="pill">${t("pill.notSupported")}</span>`;
   if (game.patch_title_match === false) return `<span class="pill blocked">${t("pill.titleMismatch")}</span>`;
   // the badge says "get a link first", with a link it's a normal update
+  if (isMissing(game)) return `<span class="pill">${t("pill.notInstalled")}</span>`;
   if (game.manual_version || (hasOlderPatch(game) && hasSavedLink(game, game.prospero_version)))
     return `<span class="pill ok">${t("pill.available")}</span>`;
   if (hasOlderPatch(game))
@@ -1467,7 +1483,7 @@ async function saveConfig() {
 // refuses anyway (no real source medium). double clicks are fine server side
 async function updateAll() {
   const targets = state.titles.filter((g) =>
-    g.status === "available" && isInstallAllowed(g) &&
+    g.status === "available" && isInstallAllowed(g) && g.installed_version &&
     !g.downloading && !g.downloaded);
   if (!targets.length) {
     showToast(t("toast.noUpdates"));

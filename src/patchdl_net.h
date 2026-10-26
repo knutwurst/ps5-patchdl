@@ -27,6 +27,10 @@ void patchdl_net_global_init(void);
 void patchdl_net_global_cleanup(void);
 
 int patchdl_http_get(const char *url, patchdl_buf_t *out);
+/* len bytes at offset, an http_code >= 400 counts as success too
+   (see patchdl_http_last_error), so check what came back */
+int patchdl_http_get_range(const char *url, long long offset, long long len,
+                           patchdl_buf_t *out);
 
 /* non-Sony hosts: no allowlist, no cert check at all (no CA store on the
    PS5). public metadata only, never anything sensitive */

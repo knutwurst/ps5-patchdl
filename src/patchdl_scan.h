@@ -63,6 +63,7 @@ typedef struct {
     int              resumable;        /* a partial download is on disk */
     int              downloaded;       /* a finished download is on disk */
     long long        partial_bytes;    /* size of that partial, for the UI */
+    int              builtin;          /* offered while not installed */
 } patchdl_title_t;
 
 int         patchdl_scan(patchdl_title_t **titles_out, size_t *count_out);

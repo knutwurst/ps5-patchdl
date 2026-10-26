@@ -1419,6 +1419,7 @@ build_titles_json(void) {
         jbuf_appendf(&j, ",\"partial_bytes\":%lld", t->partial_bytes);
         jbuf_appendf(&j, ",\"downloaded\":%s", t->downloaded ? "true" : "false");
         jbuf_appendf(&j, ",\"sideloaded\":%s", t->sideloaded ? "true" : "false");
+        jbuf_appendf(&j, ",\"builtin\":%s", t->builtin ? "true" : "false");
         jbuf_append(&j, ",\"mode\":");
             jbuf_append_str(&j, title_mode_str(t->source_type));
         jbuf_append(&j, ",\"queued\":false");
@@ -1507,6 +1508,10 @@ build_downloads_json(void) {
 }
 
 
+static int url_is_manifest(const char *url);
+static int fetch_cover(const char *title_id, const char *manifest_url);
+static int open_cached_cover(const char *title_id);
+
 static void *
 verxml_fetch_thread(void *arg) {
     (void)arg;
@@ -1548,6 +1553,16 @@ verxml_fetch_thread(void *arg) {
         t->verxml_done = 1;
         g_titles_gen++;
         pthread_mutex_unlock(&g_mutex);
+
+        if (t->builtin && t->icon_fd < 0 && url_is_manifest(t->patch_url) &&
+            !fetch_cover(t->title_id, t->patch_url)) {
+            int fd = open_cached_cover(t->title_id);
+            pthread_mutex_lock(&g_mutex);
+            if (t->icon_fd < 0) t->icon_fd = fd;
+            else if (fd >= 0) close(fd);
+            g_titles_gen++;
+            pthread_mutex_unlock(&g_mutex);
+        }
 
         /* no auto cleanup: app.db may show the new version while the patch
            never got applied */
@@ -1699,6 +1714,26 @@ remove_dl_state(const char *title_id) {
 
 /* only ever touches <drive>/patchdl/<title> */
 static void remove_dir_files(const char *dir);
+static int  cover_if_missing(const char *title_id, const char *dest);
+
+/* the card of a game that isn't installed shows the cover of its download */
+static void
+set_title_cover(const char *title_id, const char *dest) {
+    char        icon[340];
+    const char *sl = strrchr(dest, '/');
+    if (!sl) return;
+    snprintf(icon, sizeof icon, "%.*s/icon0.png", (int)(sl - dest), dest);
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            if (g_titles[i].icon_fd < 0) {
+                g_titles[i].icon_fd = open(icon, O_RDONLY);
+                g_titles_gen++;
+            }
+            break;
+        }
+    pthread_mutex_unlock(&g_mutex);
+}
 
 static void
 remove_title_dir(const char *title_id) {
@@ -2069,6 +2104,8 @@ settle_active_locked(dl_job_t *job) {
         pthread_mutex_unlock(&g_pool.mtx);
         set_title_resumable(title_id, 0, 0);
         set_title_downloaded(title_id, 1);
+        if (cover_if_missing(title_id, dest))
+            set_title_cover(title_id, dest);
         pthread_mutex_lock(&g_pool.mtx);
     } else if (job->rc == -2) {
         /* failed SHA-256, delete, not resumable */
@@ -2287,6 +2324,7 @@ admit_next(void) {
                         break;
                     }
                 pthread_mutex_unlock(&g_mutex);
+                if (!gdir[0]) snprintf(gdir, sizeof gdir, "/user/app");  /* not installed */
                 if (!download_and_install_fit(dir, gdir, need, total,
                                               &need, &free_b, &space_inst))
                     no_space = 1;
@@ -3285,13 +3323,27 @@ release_claim(install_stream_t *st) {
     pthread_mutex_unlock(&g_mutex);
 }
 
+static int cover_from_pkg(const char *dest);
+
+/* no appmeta: the game isn't there (yet), the pkg brings its cover.
+   1 when it put one next to the pkg */
+static int
+cover_if_missing(const char *title_id, const char *dest) {
+    char        icon[64];
+    struct stat st;
+    snprintf(icon, sizeof icon, "/user/appmeta/%.9s/icon0.png", title_id);
+    return stat(icon, &st) != 0 && cover_from_pkg(dest) == 0;
+}
+
 /* hand dest to the installer under an existing claim */
 static enum MHD_Result
 launch_install(struct MHD_Connection *conn, install_stream_t *st, const char *title_id,
                const char *dest, const char *content_id, const char *name) {
     char msg[256], resp[720];
-    int  rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, name,
-                                        msg, sizeof(msg));
+    int  rc;
+    cover_if_missing(title_id, dest);
+    rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, name,
+                                   msg, sizeof(msg));
     pthread_mutex_lock(&g_mutex);
     if (rc == 0) {
         st->claiming = 0;
@@ -3352,18 +3404,90 @@ typedef struct {
     install_stream_t *claim;
 } replace_job_t;
 
+/* icon0.png is entry 0x1200 of the CNT header (the _sc piece), offset
+   relative to the header. 0 when there's a plausible one */
+static int
+cover_entry(const unsigned char *hd, size_t n, uint32_t *off, uint32_t *size) {
+#define BE32(p) ((uint32_t)(p)[0] << 24 | (uint32_t)(p)[1] << 16 | (uint32_t)(p)[2] << 8 | (p)[3])
+    uint32_t cnt, tbl;
+    if (n < 0x20 || memcmp(hd, "\x7f" "CNT", 4)) return -1;
+    cnt = BE32(hd + 0x10);
+    tbl = BE32(hd + 0x18);
+    for (uint32_t i = 0; i < cnt && tbl + 32ULL * (i + 1) <= n; i++)
+        if (BE32(hd + tbl + 32 * i) == 0x1200) {
+            *off  = BE32(hd + tbl + 32 * i + 16);
+            *size = BE32(hd + tbl + 32 * i + 20);
+            return *size < 64 || *size > 8 << 20 ? -1 : 0;
+        }
+    return -1;
+#undef BE32
+}
+
+/* signature up front, IEND chunk at the very end */
+static int
+whole_png(const char *b, size_t n) {
+    return n >= 64 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8) && !memcmp(b + n - 8, "IEND", 4);
+}
+
+#define COVER_DIR PATCHDL_DATA_DIR "/covers"
+
+/* cached cover of a game that isn't installed, -1 if not there yet */
+static int
+open_cached_cover(const char *title_id) {
+    char path[64];
+    snprintf(path, sizeof path, COVER_DIR "/%.9s.png", title_id);
+    return open(path, O_RDONLY);
+}
+
+/* no install and no download to take it from: pull just the cover out of
+   the pkg on Sony's CDN, the _sc piece's header and then the png. kept in
+   COVER_DIR, so Sony gets asked once */
+static int
+fetch_cover(const char *title_id, const char *manifest_url) {
+    patchdl_manifest_t mf;
+    patchdl_buf_t      hd = {0}, img = {0};
+    const char        *sc = NULL;
+    char               path[64], tmp[72];
+    uint32_t           eoff, esz;
+    int                fd, rc = -1;
+
+    if (patchdl_fetch_manifest(manifest_url, &mf)) return -1;
+    for (int i = 0; i < mf.count; i++)
+        if (strstr(mf.pieces[i].url, "_sc.pkg")) sc = mf.pieces[i].url;
+    if (!sc && mf.count > 1) sc = mf.pieces[mf.count - 1].url;
+    if (sc && !patchdl_http_get_range(sc, 0, ORIGIN_BLOCK, &hd) && hd.size == ORIGIN_BLOCK &&
+        !cover_entry((const unsigned char *)hd.data, hd.size, &eoff, &esz) &&
+        !patchdl_http_get_range(sc, eoff, esz, &img) && img.size == esz &&
+        whole_png(img.data, img.size)) {
+        mkdir(PATCHDL_DATA_DIR, 0777);   /* fresh setup: nothing saved yet */
+        mkdir(COVER_DIR, 0777);
+        snprintf(path, sizeof path, COVER_DIR "/%.9s.png", title_id);
+        snprintf(tmp, sizeof tmp, "%s.part", path);
+        if ((fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0666)) >= 0) {
+            if (write(fd, img.data, img.size) == (ssize_t)img.size && !rename(tmp, path))
+                rc = 0;
+            close(fd);
+            if (rc) unlink(tmp);
+        }
+    }
+    free(hd.data);
+    free(img.data);
+    patchdl_manifest_free(&mf);
+    return rc;
+}
+
 /* the uninstall takes /user/appmeta along, but the pkg has its own cover:
    entry 0x1200 (icon0.png) of the _sc piece. put it next to the pkg for the
    installer's notification and Downloads entry */
-static void
+static int
 cover_from_pkg(const char *dest) {
     char          path[360], *mj = malloc(APP_JSON_MAX), *buf = NULL;
     unsigned char *hd = malloc(ORIGIN_BLOCK);
     size_t        n = strlen(dest), got;
     long long     off;
-    uint32_t      cnt, tbl, eoff = 0, esz = 0;
+    uint32_t      eoff, esz;
     FILE         *f;
-    int           fd = -1, out;
+    int           fd = -1, out, rc = -1;
 
     if (!mj || !hd || n < 5 || strcmp(dest + n - 4, ".pkg") || !strrchr(dest, '/')) goto out;
     snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
@@ -3374,25 +3498,13 @@ cover_from_pkg(const char *dest) {
     snprintf(path, sizeof path, "%.*s/icon0.png", (int)(strrchr(dest, '/') - dest), dest);
     unlink(path);   /* no cover beats the one of an older pkg */
     if ((off = sc_offset_from_json(mj)) < 0 || (fd = open(dest, O_RDONLY)) < 0) goto out;
-    if (pread(fd, hd, ORIGIN_BLOCK, (off_t)off) != ORIGIN_BLOCK || memcmp(hd, "\x7f" "CNT", 4))
-        goto out;
-#define BE32(p) ((uint32_t)(p)[0] << 24 | (uint32_t)(p)[1] << 16 | (uint32_t)(p)[2] << 8 | (p)[3])
-    cnt = BE32(hd + 0x10);
-    tbl = BE32(hd + 0x18);
-    for (uint32_t i = 0; i < cnt && tbl + 32ULL * (i + 1) <= ORIGIN_BLOCK; i++)
-        if (BE32(hd + tbl + 32 * i) == 0x1200) {
-            eoff = BE32(hd + tbl + 32 * i + 16);
-            esz  = BE32(hd + tbl + 32 * i + 20);
-            break;
-        }
-#undef BE32
-    if (esz < 64 || esz > 8 << 20 || !(buf = malloc(esz))) goto out;
-    /* whole png: signature up front, IEND chunk at the very end */
-    if (pread(fd, buf, esz, (off_t)(off + eoff)) != (ssize_t)esz ||
-        memcmp(buf, "\x89PNG\r\n\x1a\n", 8) || memcmp(buf + esz - 8, "IEND", 4))
+    if (pread(fd, hd, ORIGIN_BLOCK, (off_t)off) != ORIGIN_BLOCK) goto out;
+    if (cover_entry(hd, ORIGIN_BLOCK, &eoff, &esz) || !(buf = malloc(esz))) goto out;
+    if (pread(fd, buf, esz, (off_t)(off + eoff)) != (ssize_t)esz || !whole_png(buf, esz))
         goto out;
     if ((out = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0666)) >= 0) {
-        if (write(out, buf, esz) != (ssize_t)esz) unlink(path);
+        if (write(out, buf, esz) == (ssize_t)esz) rc = 0;
+        else unlink(path);
         close(out);
     }
 out:
@@ -3400,6 +3512,7 @@ out:
     free(buf);
     free(hd);
     free(mj);
+    return rc;
 }
 
 /* runs under the claim: uninstall, wait for the console to let go of the
@@ -3596,8 +3709,9 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                 break;
             }
         pthread_mutex_unlock(&g_mutex);
+        if (!gdir[0]) snprintf(gdir, sizeof gdir, "/user/app");  /* not installed */
         title_pkg_path(title_id, patch_url, dest, sizeof(dest));
-        if (gdir[0] && stat(dest, &pst) == 0) {
+        if (stat(dest, &pst) == 0) {
             long long need   = (long long)pst.st_size + INSTALL_SPACE_MARGIN;
             long long free_b = game_free_bytes(gdir);
             if (free_b >= 0 && free_b < need) {
@@ -4491,6 +4605,45 @@ stop_verxml(void) {
     g_verxml_started = 0;
 }
 
+/* ASTRO's PLAYROOM comes with every PS5. a restored backup can take it away
+   and without PSN there's no way back, so it shows up while it's missing */
+static void
+add_builtin_titles(patchdl_title_t **arr, size_t *cnt) {
+    static const char tid[] = "PPSA01325";
+    patchdl_title_t  *grown, *t;
+    char              dir[288], icon[320];
+    int               held = 0;
+
+    for (size_t i = 0; i < *cnt; i++)
+        if (!strcmp((*arr)[i].title_id, tid)) return;
+    /* a replace holds its own copy of the entry */
+    pthread_mutex_lock(&g_mutex);
+    for (int h = 0; h < g_held_n; h++)
+        held |= !strcmp(g_held[h].title_id, tid);
+    pthread_mutex_unlock(&g_mutex);
+    if (held || !(grown = realloc(*arr, (*cnt + 1) * sizeof **arr))) return;
+    *arr = grown;
+    t = &grown[(*cnt)++];
+    memset(t, 0, sizeof *t);
+    snprintf(t->title_id, sizeof t->title_id, "%s", tid);
+    snprintf(t->content_id, sizeof t->content_id, "IP9100-PPSA01325_00-PREINMASTER00000");
+    snprintf(t->name, sizeof t->name, "ASTRO's PLAYROOM");
+    snprintf(t->version_file_uri, sizeof t->version_file_uri,
+             "https://sgst.prod.dl.playstation.net/sgst/prod/00/np/PPSA01325_00/"
+             "c0d746cf-c687-4e72-946a-e2396b584362-version.xml");
+    t->source_type = PATCHDL_SOURCE_OFFICIAL;
+    t->pkg_sign    = PATCHDL_PKG_NONE;
+    t->enabled     = 1;
+    t->builtin     = 1;
+    /* no appmeta to take the cover from: the one from Sony, else the
+       download's */
+    if ((t->icon_fd = open_cached_cover(tid)) < 0) {
+        title_dir(tid, dir, sizeof dir);
+        snprintf(icon, sizeof icon, "%s/icon0.png", dir);
+        t->icon_fd = open(icon, O_RDONLY);
+    }
+}
+
 /* update info only carries over with same version/content id, no refresh */
 static void
 carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck) {
@@ -4533,6 +4686,7 @@ rescan_titles(int recheck) {
     g_rescan_since = t0;
     g_rescan_step  = "scan";
     if (patchdl_scan(&arr, &cnt)) { g_rescan_step = "scan failed"; return -1; }
+    add_builtin_titles(&arr, &cnt);
     t1 = mono_ms();
     g_rescan_step = "policy";
     apply_title_policy(arr, cnt);
@@ -4759,6 +4913,7 @@ patchdl_websrv_start(unsigned short port) {
 
     if (patchdl_scan(&g_titles, &g_title_count))
         g_title_count = 0;
+    add_builtin_titles(&g_titles, &g_title_count);
 
     /* default: unknown sources off, then the saved config on top */
     for (size_t i = 0; i < g_title_count; i++)

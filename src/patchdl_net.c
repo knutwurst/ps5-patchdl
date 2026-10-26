@@ -190,11 +190,22 @@ write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return total;
 }
 
-static int http_get_once(const char *url, patchdl_buf_t *out);
+static int http_get_ranged(const char *url, patchdl_buf_t *out, const char *range);
 
 int
 patchdl_http_get(const char *url, patchdl_buf_t *out) {
-    return http_get_once(url, out);
+    return http_get_ranged(url, out, NULL);
+}
+
+/* a server that ignores the range runs into the size cap */
+int
+patchdl_http_get_range(const char *url, long long offset, long long len,
+                       patchdl_buf_t *out) {
+    char range[48];
+    if (offset < 0 || len <= 0) return -1;
+    snprintf(range, sizeof range, "%lld-%lld", offset, offset + len - 1);
+    out->max = (size_t)len;
+    return http_get_ranged(url, out, range);
 }
 
 /* manifests only: network errors get two more tries on other edges.
@@ -214,13 +225,13 @@ http_get_retrying(const char *url, patchdl_buf_t *out) {
             memset(out, 0, sizeof *out);
             out->max = max;
         }
-        if (!(rc = http_get_once(url, out))) break;
+        if (!(rc = http_get_ranged(url, out, NULL))) break;
     }
     return rc;
 }
 
 static int
-http_get_once(const char *url, patchdl_buf_t *out) {
+http_get_ranged(const char *url, patchdl_buf_t *out, const char *range) {
     CURL             *curl;
     CURLcode          res;
     char              host[256];
@@ -268,6 +279,7 @@ http_get_once(const char *url, patchdl_buf_t *out) {
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
+    if (range) curl_easy_setopt(curl, CURLOPT_RANGE, range);
 
     res = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
@@ -1237,6 +1249,13 @@ patchdl_http_get(const char *url, patchdl_buf_t *out) {
     (void)url;
     (void)out;
     return -1; /* built without curl, set CURL_DIR= */
+}
+
+int
+patchdl_http_get_range(const char *url, long long offset, long long len,
+                       patchdl_buf_t *out) {
+    (void)url; (void)offset; (void)len; (void)out;
+    return -1;
 }
 
 void
