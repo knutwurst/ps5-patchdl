@@ -1122,7 +1122,9 @@ async function refreshInstallStatus() {
         const msg = st.phase === "stalled"
           ? t("install.msg.stalled")
           : st.verified
-            ? t(st.deleted ? "install.msg.verifiedDeleted" : "install.msg.verifiedKept")
+            ? t(st.deleted ? "install.msg.verifiedDeleted"
+                : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
+                : "install.msg.verifiedKept")
             : t("install.msg.unconfirmed");
         addLog("log.installEnded", { id: game.title_id, msg });
         showToast(t("toast.installEnded", { name: game.name, msg }));

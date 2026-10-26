@@ -146,14 +146,30 @@ stream_read_all(const install_stream_t *st) {
 }
 
 #define INSTALL_STALL_SECS 300
+/* every byte and the .crc are out, the console has nothing left to read */
+#define INSTALL_SETTLE_SECS 10
+
+static int
+stream_fully_served(const install_stream_t *st) {
+    return st->total > 0 && st->read >= st->total &&
+           (st->crc || !strncmp(st->title_id, "CUSA", 4));
+}
+
+/* how long the console has to stay quiet before the check runs. the check
+   itself is the proof (new version + app.json), the wait only keeps it from
+   running while the console still reads */
+static int
+stream_quiet_secs(const install_stream_t *st) {
+    return stream_fully_served(st) ? INSTALL_SETTLE_SECS : INSTALL_QUIET_SECS;
+}
 
 static const char *
 stream_phase(const install_stream_t *st, time_t now) {
     int read_all = stream_read_all(st);
     if (!read_all && now - st->last >= INSTALL_STALL_SECS) return "stalled";
     if (!read_all) return st->read ? "reading" : "waiting";
-    if (now - st->last < INSTALL_QUIET_SECS || !st->checked) return "finishing";
-    return "done";
+    /* verified counts as done for the card, the pkg may wait a bit longer */
+    return (st->checked || st->verified > 0) ? "done" : "finishing";
 }
 
 /* settings in PATCHDL_CFG_PATH, per-title enable is in the title structs */
@@ -3761,7 +3777,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
                      n++ ? "," : "", st->title_id, st->read, st->total,
                      st->crc ? "true" : "false", (long long)(now - st->last),
                      stream_phase(st, now),
-                     !st->checked ? "null" : st->verified > 0 ? "true" : "false",
+                     st->verified > 0 ? "true" : !st->checked ? "null" : "false",
                      st->deleted ? "true" : "false");
             if (sl >= sizeof streams) sl = sizeof streams - 1;
         }
@@ -4116,7 +4132,7 @@ check_one_install(int idx) {
     pthread_mutex_lock(&g_mutex);
     st = &g_streams[idx];
     if (!st->title_id[0] || st->checked || st->claiming || !stream_read_all(st) ||
-        time(NULL) - st->last < INSTALL_QUIET_SECS) {
+        time(NULL) - st->last < stream_quiet_secs(st)) {
         pthread_mutex_unlock(&g_mutex);
         return;
     }
@@ -4140,6 +4156,15 @@ check_one_install(int idx) {
               : patchdl_scan_read_patch_file(tid, "patch.json", aj, 256 * 1024)) == 0 &&
          strstr(aj, file) && strstr(aj, size_key);
     free(aj);
+    /* verified early: the card can say so, the pkg waits out the quiet
+       minute in case the console reads once more. the entry stays unchecked,
+       so the next rounds come back here and delete it */
+    if (ok && del && idle < INSTALL_QUIET_SECS) {
+        pthread_mutex_lock(&g_mutex);
+        if ((st = stream_find(tid))) st->verified = 1;
+        pthread_mutex_unlock(&g_mutex);
+        return;
+    }
     /* install_reading() would say busy, but this is the install being
        checked and it's done */
     if (ok && del) {
@@ -4172,6 +4197,7 @@ static void *
 scan_watch_thread(void *arg) {
     unsigned long long scanned = patchdl_scan_signature(), seen = scanned;
     time_t             fetched_seen = 0, next_check = 0;
+    int                retry_secs = INSTALL_QUIET_SECS;
     (void)arg;
 
     while (!g_scan_stop) {
@@ -4187,6 +4213,21 @@ scan_watch_thread(void *arg) {
         pthread_mutex_unlock(&g_mutex);
         install_done = fetched != fetched_seen &&
                        time(NULL) - fetched >= INSTALL_QUIET_SECS;
+        if (install_done) retry_secs = INSTALL_QUIET_SECS;
+        /* fully served and settled: check now instead of after a minute,
+           and retry faster while the console registers the version */
+        if (!install_done && fetched != fetched_seen) {
+            pthread_mutex_lock(&g_mutex);
+            for (int i = 0; i < MAX_STREAMS; i++) {
+                const install_stream_t *s = &g_streams[i];
+                if (s->title_id[0] && !s->checked && !s->claiming &&
+                    stream_fully_served(s) &&
+                    time(NULL) - s->last >= INSTALL_SETTLE_SECS)
+                    install_done = 1;
+            }
+            pthread_mutex_unlock(&g_mutex);
+            if (install_done) retry_secs = 15;
+        }
         if (g_scan_now || install_done ||
             (now && now != scanned && now == seen)) {
             int recheck = g_scan_now;   /* the Refresh button */
@@ -4197,7 +4238,7 @@ scan_watch_thread(void *arg) {
             if (rescan_titles(recheck) == 0) scanned = now;
             if (install_done) {
                 post_install_check();
-                next_check = time(NULL) + INSTALL_QUIET_SECS;
+                next_check = time(NULL) + retry_secs;
             }
         } else if (next_check && time(NULL) >= next_check) {
             /* not checked yet: rescan and retry each minute until it gives up */
@@ -4212,7 +4253,7 @@ scan_watch_thread(void *arg) {
             if (pending) {
                 rescan_titles(0);
                 post_install_check();
-                next_check = time(NULL) + INSTALL_QUIET_SECS;
+                next_check = time(NULL) + retry_secs;
             } else {
                 next_check = 0;
             }
