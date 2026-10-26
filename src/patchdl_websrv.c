@@ -2926,7 +2926,8 @@ static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
            patchdl_source_t src, const char *patch_url, const char *delta_url,
            const char *patch_title_id, const char *patch_storage_title_id,
-           const char *content_id, const char *version, int enabled, int force) {
+           const char *content_id, const char *name, const char *version,
+           int enabled, int force) {
     char              dest[320], msg[256], resp[720];
     int               rc;
     install_stream_t *st = NULL;
@@ -3042,7 +3043,8 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         }
     }
 
-    rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, msg, sizeof(msg));
+    rc = patchdl_install_local_pkg(dest, title_id, NULL, content_id, name,
+                                   msg, sizeof(msg));
     pthread_mutex_lock(&g_mutex);
     if (rc == 0) {
         st->claiming = 0;
@@ -3325,7 +3327,8 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
         const char *f = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "force");
         return do_install(conn, title_id, src, patch_url, delta_url,
                           patch_title_id, patch_storage_title_id,
-                          content_id, version, enabled, f && !strcmp(f, "1"));
+                          content_id, name, version, enabled,
+                          f && !strcmp(f, "1"));
     }
 
     return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");

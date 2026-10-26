@@ -13,11 +13,13 @@
 
 /* async: 0 = the installer queue took it, else the SCE error. changes the
    installed game, official titles on user request only. target_content_id
-   (app.db) is required when the pkg's title id differs, MetaInfo gets "" */
+   (app.db) is required when the pkg's title id differs, MetaInfo gets "".
+   name is what Downloads shows, NULL or "" means "PatchDL" */
 int patchdl_install_local_pkg(const char *local_path,
                               const char *expected_title_id,
                               const char *storage_title_id,
                               const char *target_content_id,
+                              const char *name,
                               char *msg, size_t msg_sz);
 
 /* load + init AppInstUtil, no install. 0 when ready */

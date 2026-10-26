@@ -553,6 +553,7 @@ int
 patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                           const char *storage_title_id,
                           const char *target_content_id,
+                          const char *name,
                           char *msg, size_t msg_sz) {
     char        sdk_path[1024];
     char        pkg_tid[48] = {0};
@@ -657,7 +658,8 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         meta.playgo_scenario_id = "";
         /* empty like etaHEN's DPI, the installer takes the pkg's own id */
         meta.content_id         = "";
-        meta.content_name       = "PatchDL";
+        /* Downloads shows this, the console adds version and "update" itself */
+        meta.content_name       = name && name[0] ? name : "PatchDL";
         meta.icon_url           = "";
 
         {
