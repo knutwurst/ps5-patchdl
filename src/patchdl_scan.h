@@ -91,6 +91,9 @@ int patchdl_scan_read_app_file(const char *title_id, const char *name,
 /* same for PS4 patches in /user/patch/<id> */
 int patchdl_scan_read_patch_file(const char *title_id, const char *name,
                                  char *buf, size_t sz);
+/* 1 when the game's app.json is on a drive the console installs to, 0 if
+   not, -1 if it can't tell. /system_ex/app is only the mount */
+int patchdl_scan_app_installed(const char *title_id);
 /* size of an installed PS4 patch.pkg on any drive, -1 if there's none */
 long long patchdl_scan_patch_size(const char *title_id);
 

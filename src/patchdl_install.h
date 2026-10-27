@@ -53,9 +53,11 @@ int patchdl_install_app_pkg(const char *local_path,
                              char *msg, size_t msg_sz);
 
 /* removes an installed app, saves stay. only for replacing a game with its
-   full update package, never on a hunch */
-int patchdl_install_uninstall(const char *title_id, char *msg, size_t msg_sz);
+   full update package, never on a hunch. shellcore: run the call under
+   ShellCore's authid. rc 0 doesn't prove anything, check the game is gone */
+int patchdl_install_uninstall(const char *title_id, int shellcore, char *msg, size_t msg_sz);
 
 /* PS4: removes the installed patch, the game stays on its base version.
    only right before the older patch goes on */
-int patchdl_install_uninstall_patch(const char *title_id, char *msg, size_t msg_sz);
+int patchdl_install_uninstall_patch(const char *title_id, int shellcore,
+                                    char *msg, size_t msg_sz);

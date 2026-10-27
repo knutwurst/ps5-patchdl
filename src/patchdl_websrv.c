@@ -109,6 +109,8 @@ typedef struct {
     int       deleted;     /* package removed after the check (setting on) */
     int       claiming;    /* an install request is starting it right now */
     int       failed;      /* never got going (replace whose install failed) */
+    int       not_removed; /* replace: the console kept the old version */
+    char      note[200];   /* replace: what each removal try did */
 } install_stream_t;
 
 #define MAX_STREAMS 8
@@ -728,6 +730,15 @@ pkg_reader_free(void *cls) {
     if (!r) return;
     close(r->fd);
     free(r);
+}
+
+/* a line of our own in the /api/pkgdiag log */
+static void
+pkg_log_note(const char *text) {
+    pthread_mutex_lock(&g_mutex);
+    snprintf(g_pkg_log[g_pkg_log_next++ % PKG_LOG_LINES], sizeof(g_pkg_log[0]),
+             "%s", text);
+    pthread_mutex_unlock(&g_mutex);
 }
 
 static void
@@ -3573,42 +3584,59 @@ out:
     return rc;
 }
 
+/* the old version is off the drives the console installs to */
+static int
+replace_old_gone(const replace_job_t *job) {
+    return job->patch_only ? patchdl_scan_patch_size(job->tid) < 0
+                           : patchdl_scan_app_installed(job->tid) == 0;
+}
+
+/* how long each removal try may take. 13.60 is done before the call
+   returns (ps5upload measured that), 9.60 took minutes for a big game */
+static const int REMOVE_WAIT_SECS[2] = { 60, 300 };
+
 /* runs under the claim: uninstall (a PS4 downgrade: only the patch), wait
-   for the console to let go of it however long it takes, then the fresh
-   install. a failure ends the claim as "stalled", so the card says so
-   instead of waiting forever */
+   until the old version is gone, then the fresh install. rc 0 proves
+   nothing, 13.60 says 0 even for a title that isn't installed, so the
+   second try runs under ShellCore's authid like ps5upload does. both
+   failing loses nothing, the game is still all there. a failure ends the
+   claim as "stalled", so the card says so instead of waiting forever */
 static void *
 replace_thread(void *arg) {
     replace_job_t *job = arg;
-    char           msg[256], *aj = NULL;
-    int            rc = -1, gone = 0;
+    char           msg[128], note[200] = "", line[200];
+    int            rc = -1, gone = 0, n = 0;
+    time_t         t0 = time(NULL);
 
-    if (job->patch_only) {
-        if (patchdl_install_uninstall_patch(job->tid, msg, sizeof msg) == 0)
-            for (int i = 0; i < 30 * 60 && !gone; i++) {
-                gone = patchdl_scan_patch_size(job->tid) < 0;
-                if (!gone) sleep(1);
-            }
-    } else {
-        cover_from_pkg(job->dest);
-        if ((aj = malloc(4096)) && patchdl_install_uninstall(job->tid, msg, sizeof msg) == 0)
-            /* the installer refuses a title that is still half there */
-            for (int i = 0; i < 30 * 60 && !gone; i++) {
-                gone = patchdl_scan_read_app_file(job->tid, "app.json", aj, 4096) != 0;
-                if (!gone) sleep(1);
-            }
+    if (!job->patch_only) cover_from_pkg(job->dest);
+    for (int attempt = 0; attempt < 2 && !gone; attempt++) {
+        int urc = job->patch_only
+            ? patchdl_install_uninstall_patch(job->tid, attempt, msg, sizeof msg)
+            : patchdl_install_uninstall(job->tid, attempt, msg, sizeof msg);
+        /* a refusal (0x80A3000C: the game runs) removes nothing, one look */
+        for (int i = 0; i < (urc ? 1 : REMOVE_WAIT_SECS[attempt]) && !gone; i++) {
+            gone = replace_old_gone(job);
+            if (!gone) sleep(1);
+        }
+        n += snprintf(note + n, sizeof note - (size_t)n, "%s%s, %s after %llds",
+                      n ? "; " : "", msg, gone ? "gone" : "still there",
+                      (long long)(time(NULL) - t0));
+        if (n >= (int)sizeof note) n = (int)sizeof note - 1;
     }
+    snprintf(line, sizeof line, "replace %s: %s", job->tid, note);
+    pkg_log_note(line);
     if (gone)
         rc = patchdl_install_local_pkg(job->dest, job->tid, NULL, job->cid,
                                        job->name[0] ? job->name : NULL,
                                        msg, sizeof msg);
-    free(aj);
     pthread_mutex_lock(&g_mutex);
+    snprintf(job->claim->note, sizeof job->claim->note, "%s", note);
     job->claim->claiming = 0;
     job->claim->started  = job->claim->last = time(NULL);
     if (rc != 0) {
-        job->claim->failed  = 1;
-        job->claim->checked = 1;
+        job->claim->failed      = 1;
+        job->claim->checked     = 1;
+        job->claim->not_removed = !gone;
     }
     pthread_mutex_unlock(&g_mutex);
     free(job);
@@ -4482,7 +4510,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     }
 
     if (!strcmp(url, "/api/installstatus")) {
-        char   p[1024], streams[MAX_STREAMS * 260 + 32];
+        char   p[1024], streams[MAX_STREAMS * 520 + 32];
         size_t pl, sl = 0;
         time_t now = time(NULL);
         patchdl_install_status_json(p, sizeof(p));
@@ -4494,12 +4522,14 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             sl += (size_t)snprintf(streams + sl, sizeof streams - sl,
                      "%s{\"title_id\":\"%s\",\"read\":%lld,\"total\":%lld,"
                      "\"crc\":%s,\"idle_secs\":%lld,\"phase\":\"%s\","
-                     "\"verified\":%s,\"deleted\":%s}",
+                     "\"verified\":%s,\"deleted\":%s,\"not_removed\":%s,"
+                     "\"note\":\"%s\"}",
                      n++ ? "," : "", st->title_id, st->read, st->total,
                      st->crc ? "true" : "false", (long long)(now - st->last),
                      stream_phase(st, now),
                      st->verified > 0 ? "true" : !st->checked ? "null" : "false",
-                     st->deleted ? "true" : "false");
+                     st->deleted ? "true" : "false",
+                     st->not_removed ? "true" : "false", st->note);
             if (sl >= sizeof streams) sl = sizeof streams - 1;
         }
         pthread_mutex_unlock(&g_mutex);

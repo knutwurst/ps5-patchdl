@@ -107,7 +107,9 @@ typedef int (*ai_install_by_pkg_fn)(ai_meta_info_t *meta, ai_pkg_info_t *info,
 typedef int (*ai_title_from_pkg_fn)(const char *path, char *title_id, int *is_app);
 typedef int (*ai_content_from_pkg_fn)(const char *path, char *content_id, int *is_app);
 typedef int (*ai_get_status_fn)(char *content_id_out, ai_install_status_t *status);
-typedef int (*ai_uninstall_fn)(const char *title_id);
+/* the two out-params take NULL (ps5upload calls it this way) */
+typedef int (*ai_uninstall_fn)(const char *title_id, int *out1, int *out2);
+typedef int (*ai_uninstall_pat_fn)(const char *title_id);
 
 static ai_init_fn             ai_initialize;
 static ai_install_pkg_fn      ai_install_pkg;
@@ -116,7 +118,7 @@ static ai_title_from_pkg_fn   ai_title_from_pkg;
 static ai_content_from_pkg_fn ai_content_from_pkg;
 static ai_get_status_fn       ai_get_status;
 static ai_uninstall_fn        ai_uninstall;
-static ai_uninstall_fn        ai_uninstall_patch;
+static ai_uninstall_pat_fn    ai_uninstall_patch;
 
 /* no sce lib linking (elfldr refuses the ELF), no raw sceKernelLoadStartModule
    (wedged the process, ask me how I know). sysmodule loader + dlsym instead.
@@ -315,7 +317,7 @@ backend_init_thread(void *arg) {
                                                      "sceAppInstUtilGetInstallStatus");
     ai_uninstall          = (ai_uninstall_fn)dynsym("libSceAppInstUtil.sprx",
                                                     "sceAppInstUtilAppUnInstall");
-    ai_uninstall_patch    = (ai_uninstall_fn)dynsym("libSceAppInstUtil.sprx",
+    ai_uninstall_patch    = (ai_uninstall_pat_fn)dynsym("libSceAppInstUtil.sprx",
                                                     "sceAppInstUtilAppUnInstallPat");
 
     fill_probe();
@@ -808,36 +810,60 @@ patchdl_install_app_pkg(const char *local_path,
     return rc;
 }
 
-int
-patchdl_install_uninstall(const char *title_id, char *msg, size_t msg_sz) {
-    int rc;
+/* ShellCore's authid. ps5upload swaps to it for every uninstall, without
+   it the console refuses from 9.60 on there. only for the one call, kept
+   for longer ps5upload saw the console restart mid-install */
+#define SHELLCORE_AUTHID 0x3800000000000010ULL
+
+static pthread_mutex_t g_uninst_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* the authid is per process, so one call at a time and back right after */
+static int
+uninstall_call(const char *title_id, int patch, int shellcore) {
+    pid_t    pid = getpid();
+    uint64_t saved = 0;
+    int      rc;
+
+    pthread_mutex_lock(&g_uninst_mtx);
+    if (shellcore && (saved = kernel_get_ucred_authid(pid)) &&
+        kernel_set_ucred_authid(pid, SHELLCORE_AUTHID) != 0)
+        saved = 0;
+    rc = patch ? ai_uninstall_patch(title_id) : ai_uninstall(title_id, NULL, NULL);
+    for (int i = 0; saved && i < 3; i++) {
+        kernel_set_ucred_authid(pid, saved);
+        if (kernel_get_ucred_authid(pid) == saved) break;
+    }
+    pthread_mutex_unlock(&g_uninst_mtx);
+    return rc;
+}
+
+static int
+uninstall_common(const char *title_id, int patch, int shellcore,
+                 char *msg, size_t msg_sz) {
+    const char *what = patch ? "patch removal" : "uninstall";
+    int         rc;
     if (!title_id || !title_id[0]) {
         snprintf(msg, msg_sz, "no title");
         return -1;
     }
     backend_wait();
-    if (g_stage != 5 || !ai_uninstall) {
-        snprintf(msg, msg_sz, "uninstall not available: %s", stage_str(g_stage));
+    if (g_stage != 5 || !(patch ? (void *)ai_uninstall_patch : (void *)ai_uninstall)) {
+        snprintf(msg, msg_sz, "%s not available: %s", what, stage_str(g_stage));
         return -1;
     }
-    rc = ai_uninstall(title_id);
-    snprintf(msg, msg_sz, rc ? "uninstall rc=0x%08x" : "uninstalled", (unsigned)rc);
+    rc = uninstall_call(title_id, patch, shellcore);
+    snprintf(msg, msg_sz, "%s%s rc=0x%08x", what, shellcore ? " as shellcore" : "",
+             (unsigned)rc);
     return rc;
 }
 
 int
-patchdl_install_uninstall_patch(const char *title_id, char *msg, size_t msg_sz) {
-    int rc;
-    if (!title_id || !title_id[0]) {
-        snprintf(msg, msg_sz, "no title");
-        return -1;
-    }
-    backend_wait();
-    if (g_stage != 5 || !ai_uninstall_patch) {
-        snprintf(msg, msg_sz, "patch removal not available: %s", stage_str(g_stage));
-        return -1;
-    }
-    rc = ai_uninstall_patch(title_id);
-    snprintf(msg, msg_sz, rc ? "patch removal rc=0x%08x" : "patch removed", (unsigned)rc);
-    return rc;
+patchdl_install_uninstall(const char *title_id, int shellcore, char *msg, size_t msg_sz) {
+    return uninstall_common(title_id, 0, shellcore, msg, msg_sz);
+}
+
+int
+patchdl_install_uninstall_patch(const char *title_id, int shellcore,
+                                char *msg, size_t msg_sz) {
+    return uninstall_common(title_id, 1, shellcore, msg, msg_sz);
 }

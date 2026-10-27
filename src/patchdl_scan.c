@@ -649,6 +649,21 @@ patchdl_scan_read_patch_file(const char *title_id, const char *name,
     return read_title_file(PATCH_DIRS, title_id, name, buf, sz);
 }
 
+int
+patchdl_scan_app_installed(const char *title_id) {
+    static const char *const dirs[] = {
+        "user/app", "mnt/ext0/user/app", "mnt/ext1/user/app", NULL,
+    };
+    char        path[PATH_MAX];
+    struct stat st;
+    if (g_sysroot_fd < 0) return -1;
+    for (int i = 0; dirs[i]; i++) {
+        snprintf(path, sizeof(path), "%s/%s/app.json", dirs[i], title_id);
+        if (fstatat(g_sysroot_fd, path, &st, 0) == 0) return 1;
+    }
+    return 0;
+}
+
 long long
 patchdl_scan_patch_size(const char *title_id) {
     char        path[PATH_MAX];

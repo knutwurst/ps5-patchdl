@@ -1115,7 +1115,7 @@ function stopInstallPolling() {
 }
 
 function installEndText(st) {
-  if (st.phase === "stalled") return t("install.msg.stalled");
+  if (st.phase === "stalled") return t(st.not_removed ? "install.msg.notRemoved" : "install.msg.stalled");
   if (!st.verified) return t("install.msg.unconfirmed");
   return t(st.deleted ? "install.msg.verifiedDeleted"
     : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
