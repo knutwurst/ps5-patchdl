@@ -119,6 +119,7 @@ let state = {
   logs: fallback.logs,
   view: "games",
   filter: "updates",
+  follow: null,   // title id the list follows from tab to tab, see renderGames
   query: "",
   usingFallback: false,
 };
@@ -472,13 +473,8 @@ function bindEvents() {
 
   document.querySelectorAll(".segmented button").forEach((button) => {
     button.addEventListener("click", () => {
-      document.querySelectorAll(".segmented button").forEach((i) => {
-        i.classList.remove("is-selected");
-        i.setAttribute("aria-pressed", "false");
-      });
-      button.classList.add("is-selected");
-      button.setAttribute("aria-pressed", "true");
-      state.filter = button.dataset.filter;
+      state.follow = null;   // picked a tab by hand, stay there
+      selectFilter(button.dataset.filter);
       renderGames();
     });
   });
@@ -666,8 +662,34 @@ function renderSettings() {
 
 /* games */
 
+function selectFilter(filter) {
+  state.filter = filter;
+  document.querySelectorAll(".segmented button").forEach((b) => {
+    const on = b.dataset.filter === filter;
+    b.classList.toggle("is-selected", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+
+// a game the user started a download, install or downgrade on changes tabs
+// on the way (Up to date -> Updates -> Up to date). switch along so it stays
+// in sight, until it has settled
+function followGame(titleId) { state.follow = titleId; }
+
+function isSettled(game) {
+  return !game.downloading && !game.resumable && !game.downloaded && !game.installing &&
+    !game._jobState && !game.manual_version && game.status !== "checking";
+}
+
 function renderGames() {
   renderGlobalStatus();
+  const followed = state.follow && state.titles.find((g) => g.title_id === state.follow);
+  let moved = false;
+  if (followed && state.filter !== "all" && gameCategory(followed) !== state.filter) {
+    selectFilter(gameCategory(followed));
+    moved = true;
+  }
+  if (followed && isSettled(followed)) state.follow = null;
   const counts = { updates: 0, uptodate: 0, blocked: 0, all: state.titles.length };
   state.titles.forEach((g) => { counts[gameCategory(g)]++; });
   document.querySelectorAll(".segmented button").forEach((b) => {
@@ -686,6 +708,10 @@ function renderGames() {
     return;
   }
   visible.forEach((game) => els.gameGrid.appendChild(createGameCard(game)));
+  if (moved) {
+    const card = els.gameGrid.querySelector(`[data-title-id="${CSS.escape(followed.title_id)}"]`);
+    if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
 }
 
 function isPs4(game) { return (game.title_id || "").startsWith("CUSA"); }
@@ -1629,6 +1655,7 @@ async function cancelDownload(titleId) {
 async function runTitleAction(titleId, action) {
   const game = state.titles.find((i) => i.title_id === titleId);
   if (!game) return;
+  if (action !== "pause" && action !== "guide") followGame(titleId);
   // update = download, the reconciler installs once it's done
   if (action === "download" || action === "update") await doDownload(game);
   else if (action === "install") await doInstall(game);
@@ -2243,6 +2270,7 @@ async function savedDownload(game, version, size, force = false) {
 }
 
 function manualDownloadStarted(game, version) {
+  followGame(game.title_id);
   game.manual_version = version;
   game.manual_downgrade = isOlder(game, version);
   game.downloading = true;
