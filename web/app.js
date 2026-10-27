@@ -1577,7 +1577,9 @@ async function doInstall(game, force = false, replace = false) {
       // it only goes on as the whole game, one question and the rest is the same
       game.installing = false;
       renderGames();
-      if (window.confirm(t(b.downgrade ? "install.confirmDowngrade" : "install.confirmReplace", { name: game.name })))
+      const ask = !b.downgrade ? "install.confirmReplace"
+        : b.ps4 ? "install.confirmDowngradePs4" : "install.confirmDowngrade";
+      if (window.confirm(t(ask, { name: game.name })))
         return doInstall(game, force, true);
       return false;
     }
@@ -1948,13 +1950,13 @@ function canPickVersion(game, version) {
     isDownloadAllowed({ ...game, manual_version: version });
 }
 
-// older than installed: PS5 only, it goes on as the whole game
+// older than installed: a PS5 game goes on whole, a PS4 one gets its patch swapped
 function isOlder(game, version) {
   return Boolean(game.installed_version) && version < game.installed_version;
 }
 
 function canDowngrade(game, version) {
-  return !isPs4(game) && isOlder(game, version) && canPickVersion(game, version);
+  return isOlder(game, version) && canPickVersion(game, version);
 }
 
 function canGetOlderPatch(game) {

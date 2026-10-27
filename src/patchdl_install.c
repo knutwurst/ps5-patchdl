@@ -116,6 +116,7 @@ static ai_title_from_pkg_fn   ai_title_from_pkg;
 static ai_content_from_pkg_fn ai_content_from_pkg;
 static ai_get_status_fn       ai_get_status;
 static ai_uninstall_fn        ai_uninstall;
+static ai_uninstall_fn        ai_uninstall_patch;
 
 /* no sce lib linking (elfldr refuses the ELF), no raw sceKernelLoadStartModule
    (wedged the process, ask me how I know). sysmodule loader + dlsym instead.
@@ -314,6 +315,8 @@ backend_init_thread(void *arg) {
                                                      "sceAppInstUtilGetInstallStatus");
     ai_uninstall          = (ai_uninstall_fn)dynsym("libSceAppInstUtil.sprx",
                                                     "sceAppInstUtilAppUnInstall");
+    ai_uninstall_patch    = (ai_uninstall_fn)dynsym("libSceAppInstUtil.sprx",
+                                                    "sceAppInstUtilAppUnInstallPat");
 
     fill_probe();
 
@@ -819,5 +822,22 @@ patchdl_install_uninstall(const char *title_id, char *msg, size_t msg_sz) {
     }
     rc = ai_uninstall(title_id);
     snprintf(msg, msg_sz, rc ? "uninstall rc=0x%08x" : "uninstalled", (unsigned)rc);
+    return rc;
+}
+
+int
+patchdl_install_uninstall_patch(const char *title_id, char *msg, size_t msg_sz) {
+    int rc;
+    if (!title_id || !title_id[0]) {
+        snprintf(msg, msg_sz, "no title");
+        return -1;
+    }
+    backend_wait();
+    if (g_stage != 5 || !ai_uninstall_patch) {
+        snprintf(msg, msg_sz, "patch removal not available: %s", stage_str(g_stage));
+        return -1;
+    }
+    rc = ai_uninstall_patch(title_id);
+    snprintf(msg, msg_sz, rc ? "patch removal rc=0x%08x" : "patch removed", (unsigned)rc);
     return rc;
 }

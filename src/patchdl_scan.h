@@ -91,6 +91,8 @@ int patchdl_scan_read_app_file(const char *title_id, const char *name,
 /* same for PS4 patches in /user/patch/<id> */
 int patchdl_scan_read_patch_file(const char *title_id, const char *name,
                                  char *buf, size_t sz);
+/* size of an installed PS4 patch.pkg on any drive, -1 if there's none */
+long long patchdl_scan_patch_size(const char *title_id);
 
 /* len bytes at offset of an installed app's file, e.g. a slice of app.pkg.
    bytes read, -1 if the file isn't there */

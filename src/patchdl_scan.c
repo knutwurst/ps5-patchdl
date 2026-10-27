@@ -649,6 +649,18 @@ patchdl_scan_read_patch_file(const char *title_id, const char *name,
     return read_title_file(PATCH_DIRS, title_id, name, buf, sz);
 }
 
+long long
+patchdl_scan_patch_size(const char *title_id) {
+    char        path[PATH_MAX];
+    struct stat st;
+    if (g_sysroot_fd < 0) return -1;
+    for (int i = 0; PATCH_DIRS[i]; i++) {
+        snprintf(path, sizeof(path), "%s/%s/patch.pkg", PATCH_DIRS[i] + 1, title_id);
+        if (fstatat(g_sysroot_fd, path, &st, 0) == 0) return (long long)st.st_size;
+    }
+    return -1;
+}
+
 ssize_t
 patchdl_scan_read_app_range(const char *title_id, const char *name,
                             long long offset, void *buf, size_t len) {

@@ -3458,6 +3458,7 @@ unhold_title_locked(const char *title_id) {
 
 typedef struct {
     char              tid[16], dest[320], cid[64], name[128];
+    int               patch_only;   /* PS4: only the patch comes off */
     install_stream_t *claim;
 } replace_job_t;
 
@@ -3572,27 +3573,35 @@ out:
     return rc;
 }
 
-/* runs under the claim: uninstall, wait for the console to let go of the
-   title however long it takes, then the fresh install. a failure ends the
-   claim as "stalled", so the card says so instead of waiting forever */
+/* runs under the claim: uninstall (a PS4 downgrade: only the patch), wait
+   for the console to let go of it however long it takes, then the fresh
+   install. a failure ends the claim as "stalled", so the card says so
+   instead of waiting forever */
 static void *
 replace_thread(void *arg) {
     replace_job_t *job = arg;
-    char           msg[256], *aj = malloc(4096);
+    char           msg[256], *aj = NULL;
     int            rc = -1, gone = 0;
 
-    cover_from_pkg(job->dest);
-    if (aj && patchdl_install_uninstall(job->tid, msg, sizeof msg) == 0) {
-        /* the installer refuses a title that is still half there */
-        for (int i = 0; i < 30 * 60 && !gone; i++) {
-            gone = patchdl_scan_read_app_file(job->tid, "app.json", aj, 4096) != 0;
-            if (!gone) sleep(1);
-        }
-        if (gone)
-            rc = patchdl_install_local_pkg(job->dest, job->tid, NULL, job->cid,
-                                           job->name[0] ? job->name : NULL,
-                                           msg, sizeof msg);
+    if (job->patch_only) {
+        if (patchdl_install_uninstall_patch(job->tid, msg, sizeof msg) == 0)
+            for (int i = 0; i < 30 * 60 && !gone; i++) {
+                gone = patchdl_scan_patch_size(job->tid) < 0;
+                if (!gone) sleep(1);
+            }
+    } else {
+        cover_from_pkg(job->dest);
+        if ((aj = malloc(4096)) && patchdl_install_uninstall(job->tid, msg, sizeof msg) == 0)
+            /* the installer refuses a title that is still half there */
+            for (int i = 0; i < 30 * 60 && !gone; i++) {
+                gone = patchdl_scan_read_app_file(job->tid, "app.json", aj, 4096) != 0;
+                if (!gone) sleep(1);
+            }
     }
+    if (gone)
+        rc = patchdl_install_local_pkg(job->dest, job->tid, NULL, job->cid,
+                                       job->name[0] ? job->name : NULL,
+                                       msg, sizeof msg);
     free(aj);
     pthread_mutex_lock(&g_mutex);
     job->claim->claiming = 0;
@@ -3608,12 +3617,14 @@ replace_thread(void *arg) {
 
 /* the update builds on another base than the installed game: take the game
    off and put the update on as the whole game. PS5 updates carry all of it,
-   saves stay, a disc game keeps using its disc as the license. only after
-   the user said yes to it */
+   saves stay, a disc game keeps using its disc as the license. patch_only:
+   a PS4 downgrade, only the installed patch comes off, the game stays. only
+   after the user said yes to it */
 static enum MHD_Result
 do_replace_install(struct MHD_Connection *conn, const char *title_id,
                    const char *dest, const char *version, const char *name,
-                   const char *game_dir, int force) {
+                   const char *game_dir, const char *content_id, int force,
+                   int patch_only) {
     char              ecid[64] = "", etid[48] = "", msg[128], resp[320], tag[16];
     char             *aj;
     const char       *reason;
@@ -3623,13 +3634,17 @@ do_replace_install(struct MHD_Connection *conn, const char *title_id,
     replace_job_t    *job;
     pthread_t         th;
 
-    /* nothing goes on as this game unless the pkg says it is this game */
-    if (patchdl_install_pkg_meta(dest, ecid, sizeof ecid, etid, sizeof etid,
-                                 &is_app, msg, sizeof msg) != 0 || !ecid[0])
+    /* nothing goes on as this game unless the pkg says it is this game. a
+       PS4 patch came from a link checked against the title, and the game
+       stays, so it goes on like any other patch */
+    if (patch_only)
+        snprintf(ecid, sizeof ecid, "%s", content_id ? content_id : "");
+    else if (patchdl_install_pkg_meta(dest, ecid, sizeof ecid, etid, sizeof etid,
+                                      &is_app, msg, sizeof msg) != 0 || !ecid[0])
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"pkg_unreadable\"}");
     snprintf(tag, sizeof tag, "-%.9s_", title_id);
-    if (!strstr(ecid, tag))
+    if (!patch_only && !strstr(ecid, tag))
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"pkg_title_mismatch\"}");
 
@@ -3637,14 +3652,17 @@ do_replace_install(struct MHD_Connection *conn, const char *title_id,
     if (!force && stat(dest, &st) == 0) {
         long long need = (long long)st.st_size + INSTALL_SPACE_MARGIN;
         long long free_b = game_free_bytes(game_dir);
-        char      size_s[24] = "";
-        aj = malloc(APP_JSON_MAX);
-        if (aj && patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX) == 0) {
-            const char *k = strstr(aj, "\"originalFileSize\":");
-            if (k) snprintf(size_s, sizeof size_s, "%.20s", k + 19);
+        long long back = 0;
+        if (patch_only) {
+            back = patchdl_scan_patch_size(title_id);
+        } else if ((aj = malloc(APP_JSON_MAX))) {
+            if (patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX) == 0) {
+                const char *k = strstr(aj, "\"originalFileSize\":");
+                if (k) back = strtoll(k + 19, NULL, 10);
+            }
+            free(aj);
         }
-        free(aj);
-        if (free_b >= 0) free_b += strtoll(size_s, NULL, 10);
+        if (free_b >= 0 && back > 0) free_b += back;
         if (free_b >= 0 && free_b < need) {
             snprintf(resp, sizeof resp,
                      "{\"ok\":false,\"reason\":\"install_space\","
@@ -3666,17 +3684,21 @@ do_replace_install(struct MHD_Connection *conn, const char *title_id,
         char   jpath[360];
         size_t dl = strlen(dest);
         snprintf(jpath, sizeof jpath, "%.*s.json", (int)(dl > 4 ? dl - 4 : dl), dest);
+        /* PS4 pkgs go on without a local manifest */
         if (stat(dest, &st) != 0 || st.st_size != claim->total || claim->total <= 0 ||
-            stat(jpath, &st) != 0 || !download_complete(title_id)) {
+            (!patch_only && stat(jpath, &st) != 0) || !download_complete(title_id)) {
             release_claim(claim);
             pthread_mutex_unlock(&g_cancel_mtx);
             return queue_json(conn, MHD_HTTP_CONFLICT,
                               "{\"ok\":false,\"reason\":\"download_incomplete\"}");
         }
     }
-    pthread_mutex_lock(&g_mutex);
-    hold_title_locked(title_id);
-    pthread_mutex_unlock(&g_mutex);
+    /* the game goes away for a while, keep its card. a PS4 one stays */
+    if (!patch_only) {
+        pthread_mutex_lock(&g_mutex);
+        hold_title_locked(title_id);
+        pthread_mutex_unlock(&g_mutex);
+    }
     pthread_mutex_unlock(&g_cancel_mtx);
 
     if (!(job = calloc(1, sizeof *job))) {
@@ -3687,6 +3709,7 @@ do_replace_install(struct MHD_Connection *conn, const char *title_id,
     snprintf(job->dest, sizeof job->dest, "%s", dest);
     snprintf(job->cid, sizeof job->cid, "%s", ecid);
     snprintf(job->name, sizeof job->name, "%s", name ? name : "");
+    job->patch_only = patch_only;
     job->claim = claim;
     if (pthread_create(&th, NULL, replace_thread, job)) {
         free(job);
@@ -3746,6 +3769,20 @@ ensure_local_manifest(const char *title_id, const char *patch_url, const char *d
     patchdl_manifest_free(&mf);
 }
 
+/* where the game is installed, /user/app when it isn't */
+static void
+title_game_dir(const char *title_id, char *buf, size_t sz) {
+    buf[0] = '\0';
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            snprintf(buf, sz, "%s", g_titles[i].source_path);
+            break;
+        }
+    pthread_mutex_unlock(&g_mutex);
+    if (!buf[0]) snprintf(buf, sz, "/user/app");
+}
+
 static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
            patchdl_source_t src, const char *patch_url, const char *delta_url,
@@ -3794,15 +3831,27 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                 return queue_json(conn, MHD_HTTP_CONFLICT, down
                     ? "{\"ok\":false,\"reason\":\"needs_reinstall\",\"downgrade\":true}"
                     : "{\"ok\":false,\"reason\":\"needs_reinstall\"}");
-            pthread_mutex_lock(&g_mutex);
-            for (size_t i = 0; i < g_title_count; i++)
-                if (!strcmp(g_titles[i].title_id, title_id)) {
-                    snprintf(gdir, sizeof gdir, "%s", g_titles[i].source_path);
-                    break;
-                }
-            pthread_mutex_unlock(&g_mutex);
-            return do_replace_install(conn, title_id, dest, version, name, gdir, force);
+            title_game_dir(title_id, gdir, sizeof gdir);
+            return do_replace_install(conn, title_id, dest, version, name, gdir,
+                                      NULL, force, 0);
         }
+    }
+
+    /* PS4: every patch builds on the base game, so an older one goes on once
+       the installed patch is off. the game stays. ask first */
+    if (!strncmp(title_id, "CUSA", 4) && version_older(title_id, version) &&
+        patchdl_scan_patch_size(title_id) >= 0) {
+        char gdir[256] = "";
+        if (patch_title_id[0] && strncmp(patch_title_id, title_id, 9) != 0)
+            return queue_json(conn, MHD_HTTP_CONFLICT,
+                              "{\"ok\":false,\"reason\":\"patch_title_mismatch\"}");
+        if (!replace)
+            return queue_json(conn, MHD_HTTP_CONFLICT,
+                "{\"ok\":false,\"reason\":\"needs_reinstall\",\"downgrade\":true,\"ps4\":true}");
+        title_game_dir(title_id, gdir, sizeof gdir);
+        title_pkg_path(title_id, patch_url, dest, sizeof(dest));
+        return do_replace_install(conn, title_id, dest, version, name, gdir,
+                                  content_id, force, 1);
     }
 
     /* the update lands next to the game and needs about the pkg size free
@@ -3811,14 +3860,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
     if (!force) {
         char        gdir[256] = "";
         struct stat pst;
-        pthread_mutex_lock(&g_mutex);
-        for (size_t i = 0; i < g_title_count; i++)
-            if (!strcmp(g_titles[i].title_id, title_id)) {
-                snprintf(gdir, sizeof gdir, "%s", g_titles[i].source_path);
-                break;
-            }
-        pthread_mutex_unlock(&g_mutex);
-        if (!gdir[0]) snprintf(gdir, sizeof gdir, "/user/app");  /* not installed */
+        title_game_dir(title_id, gdir, sizeof gdir);
         title_pkg_path(title_id, patch_url, dest, sizeof(dest));
         if (stat(dest, &pst) == 0) {
             long long need   = (long long)pst.st_size + INSTALL_SPACE_MARGIN;
@@ -3999,12 +4041,9 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
             "{\"ok\":false,\"reason\":\"source_not_supported\"}");
 
-    /* older than installed: only when asked for, and only the PS5 can take
-       it, as the whole game. a PS4 patch builds on the installed one */
+    /* older than installed: only when asked for. a PS5 game goes on as
+       the whole game, a PS4 one gets its patch swapped */
     down = version_older(tid, ver);
-    if (down && !strncmp(tid, "CUSA", 4))
-        return queue_json(conn, MHD_HTTP_CONFLICT,
-            "{\"ok\":false,\"reason\":\"downgrade_ps5_only\"}");
     if (down && !json_get_bool(body, "downgrade", 0))
         return queue_json(conn, MHD_HTTP_CONFLICT,
             "{\"ok\":false,\"reason\":\"older_than_installed\"}");
