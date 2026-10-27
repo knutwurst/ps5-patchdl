@@ -785,10 +785,13 @@ install_reading(const char *title_id) {
     int    busy;
     pthread_mutex_lock(&g_mutex);
     st   = stream_find(title_id);
-    /* own installs stay protected until checked or stalled */
+    /* own installs stay protected until checked or stalled. the quiet
+       minute covers installs from before a restart and unconfirmed ones,
+       a verified one is over */
     busy = (st && (st->claiming ||
                    (!st->checked && strcmp(stream_phase(st, now), "stalled")))) ||
-           (g_pkg_last_tid[0] && !strncmp(g_pkg_last_tid, title_id, 9) &&
+           ((!st || !st->checked || st->verified != 1) &&
+            g_pkg_last_tid[0] && !strncmp(g_pkg_last_tid, title_id, 9) &&
             now - g_pkg_last_time < INSTALL_QUIET_SECS);
     pthread_mutex_unlock(&g_mutex);
     return busy;
@@ -1420,7 +1423,14 @@ build_titles_json(void) {
         jbuf_appendf(&j, ",\"enabled\":%s", t->enabled ? "true" : "false");
         jbuf_appendf(&j, ",\"resumable\":%s", t->resumable ? "true" : "false");
         jbuf_appendf(&j, ",\"partial_bytes\":%lld", t->partial_bytes);
-        jbuf_appendf(&j, ",\"downloaded\":%s", t->downloaded ? "true" : "false");
+        {
+            /* installed and verified, the pkg only waits for its delete.
+               nothing for the user to do with it */
+            const install_stream_t *st = stream_find(t->title_id);
+            int leaving = st && st->verified == 1 && !st->checked;
+            jbuf_appendf(&j, ",\"downloaded\":%s",
+                         t->downloaded && !leaving ? "true" : "false");
+        }
         jbuf_appendf(&j, ",\"sideloaded\":%s", t->sideloaded ? "true" : "false");
         jbuf_appendf(&j, ",\"builtin\":%s", t->builtin ? "true" : "false");
         jbuf_append(&j, ",\"mode\":");
@@ -4843,7 +4853,7 @@ check_one_install(int idx) {
     char             *aj;
     long long         total, idle;
     time_t            last;
-    int               del, ok, deleted = 0;
+    int               del, ok, deleted = 0, settle;
     install_stream_t *st;
 
     pthread_mutex_lock(&g_mutex);
@@ -4856,9 +4866,10 @@ check_one_install(int idx) {
     snprintf(tid, sizeof tid, "%s", st->title_id);
     snprintf(ver, sizeof ver, "%s", st->version);
     snprintf(file, sizeof file, "%s", st->file);
-    total = st->total;
-    last  = st->last;
-    del   = g_cfg.delete_pkg_after_install;
+    total  = st->total;
+    last   = st->last;
+    settle = stream_quiet_secs(st);
+    del    = g_cfg.delete_pkg_after_install;
     pthread_mutex_unlock(&g_mutex);
 
     /* app.json lists every piece URL, give it room */
@@ -4873,10 +4884,12 @@ check_one_install(int idx) {
               : patchdl_scan_read_patch_file(tid, "patch.json", aj, 256 * 1024)) == 0 &&
          strstr(aj, file) && strstr(aj, size_key);
     free(aj);
-    /* verified early: the card can say so, the pkg waits out the quiet
-       minute in case the console reads once more. the entry stays unchecked,
-       so the next rounds come back here and delete it */
-    if (ok && del && idle < INSTALL_QUIET_SECS) {
+    /* verified early: the card can say so, the pkg waits until the console
+       has been quiet for a bit in case it reads once more. every byte served:
+       the short settle (Ghostwire read nothing after its last byte), else the
+       quiet minute. the entry stays unchecked, so the next rounds come back
+       here and delete it */
+    if (ok && del && idle < settle) {
         pthread_mutex_lock(&g_mutex);
         if ((st = stream_find(tid))) st->verified = 1;
         pthread_mutex_unlock(&g_mutex);
