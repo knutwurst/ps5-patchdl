@@ -81,7 +81,10 @@ From Sony's update servers, the same files the console would download itself. No
 Sony only tells the console about the newest patch. The version history comes from [Prospero Patches](https://prosperopatches.com/) for PS5 games and [Orbis Patches](https://orbispatches.com/) for PS4 games. PatchDL sends them the game's title ID, nothing else.
 
 **How do I get a specific version?**
-Open Other versions on the game, pick a version and follow the steps. You copy one link from the patch site (on the PS5 you scan a QR code and do that part on your phone), paste it, and PatchDL downloads that version from Sony. Only versions newer than the installed one can be installed.
+Open Other versions on the game, pick a version and follow the steps. You copy one link from the patch site (on the PS5 you scan a QR code and do that part on your phone), paste it, and PatchDL downloads that version from Sony.
+
+**Can I go back to an older version?**
+On PS5 games, yes. Older versions under Other versions have a Downgrade button. A PS5 update contains the whole game, so PatchDL removes the installed game and puts the older version on. Your saves stay, but a save made with the newer version may not load in the older one. Turn off updates for that game afterwards, or Update all brings it back to the newest version. PS4 patches build on the installed one and only go forward.
 
 **When is the package deleted?**
 Only after the console reports the new version and its installer has registered the package. Otherwise it stays. You can turn deleting off in Settings.
