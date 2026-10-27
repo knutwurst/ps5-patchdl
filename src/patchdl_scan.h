@@ -59,6 +59,7 @@ typedef struct {
     /* from a pasted Prospero link, replaces patch_url when set */
     char             manual_url[512];
     char             manual_version[16];
+    int              manual_down;      /* that link is older than installed */
     int              enabled;          /* user setting, config.json */
     int              resumable;        /* a partial download is on disk */
     int              downloaded;       /* a finished download is on disk */

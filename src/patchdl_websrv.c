@@ -1303,11 +1303,12 @@ apply_title_policy(patchdl_title_t *arr, size_t cnt) {
 }
 
 
-/* a pasted link counts while it's newer than installed, stays until Cancel */
+/* a pasted link counts while it's newer than installed, a downgrade until
+   that version is on. stays until Cancel */
 static int
 manual_pending(const patchdl_title_t *t) {
-    return t->manual_url[0] &&
-           strcmp(t->manual_version, t->installed_version) > 0;
+    int cmp = strcmp(t->manual_version, t->installed_version);
+    return t->manual_url[0] && (t->manual_down ? cmp != 0 : cmp > 0);
 }
 
 static const char *
@@ -1404,6 +1405,8 @@ build_titles_json(void) {
                      t->prospero_done ? "true" : "false");
         jbuf_append(&j, ",\"manual_version\":");
             jbuf_append_ver_or_null(&j, manual_pending(t) ? t->manual_version : "");
+        jbuf_appendf(&j, ",\"manual_downgrade\":%s",
+                     manual_pending(t) && t->manual_down ? "true" : "false");
         {
             char vers[16][16];
             int  nv = patchdl_links_versions(t->title_id, vers, 16);
@@ -1770,26 +1773,30 @@ manual_source_path(const char *title_id, char *out, size_t sz) {
 
 /* next to the download so it survives a restart, Cancel deletes it */
 static void
-save_manual_source(const char *title_id, const char *url, const char *version) {
+save_manual_source(const char *title_id, const char *url, const char *version,
+                   int down) {
     char  dir[288], path[320];
     FILE *f;
     title_dir(title_id, dir, sizeof dir);
     make_title_dir(dir);
     manual_source_path(title_id, path, sizeof path);
     if ((f = fopen(path, "w"))) {
-        fprintf(f, "{\"url\":\"%s\",\"version\":\"%s\"}\n", url, version);
+        fprintf(f, "{\"url\":\"%s\",\"version\":\"%s\",\"downgrade\":%s}\n",
+                url, version, down ? "true" : "false");
         fclose(f);
     }
 }
 
 static void
-set_manual_source(const char *title_id, const char *url, const char *version) {
+set_manual_source(const char *title_id, const char *url, const char *version,
+                  int down) {
     pthread_mutex_lock(&g_mutex);
     for (size_t i = 0; i < g_title_count; i++)
         if (!strcmp(g_titles[i].title_id, title_id)) {
             snprintf(g_titles[i].manual_url, sizeof g_titles[i].manual_url, "%s", url);
             snprintf(g_titles[i].manual_version, sizeof g_titles[i].manual_version,
                      "%s", version);
+            g_titles[i].manual_down = down;
             break;
         }
     pthread_mutex_unlock(&g_mutex);
@@ -1798,7 +1805,7 @@ set_manual_source(const char *title_id, const char *url, const char *version) {
 static void
 clear_manual_source(const char *title_id) {
     char path[320], dir[288];
-    set_manual_source(title_id, "", "");
+    set_manual_source(title_id, "", "", 0);
     manual_source_path(title_id, path, sizeof path);
     unlink(path);
     title_dir(title_id, dir, sizeof dir);
@@ -1822,6 +1829,7 @@ load_manual_sources(patchdl_title_t *arr, size_t cnt) {
         buf[n] = '\0';
         json_get_str(buf, "url", t->manual_url, sizeof t->manual_url);
         json_get_str(buf, "version", t->manual_version, sizeof t->manual_version);
+        t->manual_down = json_get_bool(buf, "downgrade", 0);
         /* keep it even if app.db shows this version, the install may not have
            applied the patch */
         if (!url_is_manifest(t->manual_url) || !t->manual_version[0])
@@ -1861,12 +1869,31 @@ version_installed(const char *title_id, const char *version) {
     pthread_mutex_lock(&g_mutex);
     for (size_t i = 0; i < g_title_count; i++)
         if (!strcmp(g_titles[i].title_id, title_id)) {
-            done = g_titles[i].installed_version[0] &&
-                   strcmp(g_titles[i].installed_version, version) >= 0;
+            const patchdl_title_t *t = &g_titles[i];
+            int cmp = strcmp(t->installed_version, version);
+            /* a downgrade is done once that exact version is on */
+            done = t->installed_version[0] &&
+                   (t->manual_down && !strcmp(t->manual_version, version)
+                        ? cmp == 0 : cmp >= 0);
             break;
         }
     pthread_mutex_unlock(&g_mutex);
     return done;
+}
+
+/* the game is on and newer than version */
+static int
+version_older(const char *title_id, const char *version) {
+    int older = 0;
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            older = g_titles[i].installed_version[0] &&
+                    strcmp(version, g_titles[i].installed_version) < 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_mutex);
+    return older;
 }
 
 static long long
@@ -3028,6 +3055,9 @@ queue_versions(struct MHD_Connection *conn, const char *tid) {
         jbuf_append(&j, ",\"fw\":");    jbuf_append_str(&j, list[i].required_fw);
         jbuf_append(&j, ",\"size\":");  jbuf_append_str(&j, list[i].size);
         jbuf_append(&j, ",\"state\":"); jbuf_append_str(&j, state);
+        /* an older one may still need newer firmware */
+        jbuf_appendf(&j, ",\"fw_ok\":%s",
+                     !ps4 && list[i].fw_bin > g_fw.bin ? "false" : "true");
         jbuf_append(&j, "}");
     }
     jbuf_append(&j, "]}");
@@ -3725,15 +3755,18 @@ do_install(struct MHD_Connection *conn, const char *title_id,
     }
 
     /* PS5: an update on another base than the installed game is turned down
-       by the console, it only goes on as the whole game. ask first */
+       by the console, it only goes on as the whole game. same for an older
+       version. ask first */
     if (strncmp(title_id, "CUSA", 4) && url_is_manifest(patch_url)) {
+        int down = version_older(title_id, version);
         title_pkg_path(title_id, patch_url, dest, sizeof(dest));
         ensure_local_manifest(title_id, patch_url, dest);
-        if (update_fits_installed(title_id, dest) == 0) {
+        if (down || update_fits_installed(title_id, dest) == 0) {
             char gdir[256] = "";
             if (!replace)
-                return queue_json(conn, MHD_HTTP_CONFLICT,
-                                  "{\"ok\":false,\"reason\":\"needs_reinstall\"}");
+                return queue_json(conn, MHD_HTTP_CONFLICT, down
+                    ? "{\"ok\":false,\"reason\":\"needs_reinstall\",\"downgrade\":true}"
+                    : "{\"ok\":false,\"reason\":\"needs_reinstall\"}");
             pthread_mutex_lock(&g_mutex);
             for (size_t i = 0; i < g_title_count; i++)
                 if (!strcmp(g_titles[i].title_id, title_id)) {
@@ -3895,7 +3928,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
     char             cid[64], tname[128], tv[16];
     const char      *p, *why;
     struct stat      st;
-    int              en = 0, busy = 0, pieces, saved;
+    int              en = 0, busy = 0, pieces, saved, down;
     long long        found;
     patchdl_source_t src = PATCHDL_SOURCE_UNKNOWN;
 
@@ -3937,6 +3970,16 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
         src == PATCHDL_SOURCE_SHADOWMOUNT)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
             "{\"ok\":false,\"reason\":\"source_not_supported\"}");
+
+    /* older than installed: only when asked for, and only the PS5 can take
+       it, as the whole game. a PS4 patch builds on the installed one */
+    down = version_older(tid, ver);
+    if (down && !strncmp(tid, "CUSA", 4))
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+            "{\"ok\":false,\"reason\":\"downgrade_ps5_only\"}");
+    if (down && !json_get_bool(body, "downgrade", 0))
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+            "{\"ok\":false,\"reason\":\"older_than_installed\"}");
 
     /* versions share the file name, so cancel the old download first */
     pthread_mutex_lock(&g_pool.mtx);
@@ -3992,11 +4035,11 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
     patchdl_links_put(tid, ver, canon);
     /* do_download says no to an installed version too, but only after the
        manual source would have left a stray folder behind */
-    if (version_installed(tid, ver))
+    if (!down && version_installed(tid, ver))
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"already_installed\"}");
-    save_manual_source(tid, canon, ver);
-    set_manual_source(tid, canon, ver);
+    save_manual_source(tid, canon, ver, down);
+    set_manual_source(tid, canon, ver, down);
     return do_download(conn, tid, src, canon, "", tname, ver, en);
 }
 
@@ -4705,6 +4748,7 @@ carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck)
     dst->downloaded    = src->downloaded;
     memcpy(dst->manual_url, src->manual_url, sizeof dst->manual_url);
     memcpy(dst->manual_version, src->manual_version, sizeof dst->manual_version);
+    dst->manual_down = src->manual_down;
     /* an explicit refresh asks Sony again for new patches */
     if (recheck || strcmp(dst->installed_version, src->installed_version) ||
         strcmp(dst->content_id, src->content_id))

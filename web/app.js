@@ -252,7 +252,9 @@ async function openVersions(titleId) {
     ${older.length ? `
       <details class="vgroup volder">
         <summary>${icon("chevron")}${t("versions.olderGroup", { count: older.length })}</summary>
-        <ul class="vlist">${older.map((r) => row(r, "")).join("")}</ul>
+        <ul class="vlist">${older.map((r) => row(r, r.fw_ok !== false && canDowngrade(game, r.version)
+          ? `<button type="button" class="row-button is-ghost" data-pick="${escapeHtml(r.version)}" data-size="${escapeHtml(r.size || "")}">${icon("download")}${t("versions.downgrade")}</button>`
+          : "")).join("")}</ul>
       </details>` : ""}
     <p class="sheet-source">${t("versions.source", { site: `<a href="${escapeHtml(data.page)}" target="_blank" rel="noopener">${escapeHtml(data.site)}${icon("external")}</a>` })}</p>`;
   body.querySelectorAll("[data-pick]").forEach((btn) => btn.addEventListener("click", () => {
@@ -541,9 +543,10 @@ async function loadInitialData({ quiet = false } = {}) {
       g.installDone = old.installDone;
       g.installTotal = old.installTotal;
     }
-    // up_to_date / incompatible_fw: nothing left to fetch, drop stale flags
-    if (old && g.status !== "up_to_date" &&
-        (g.status !== "incompatible_fw" || g.manual_version)) {
+    // up_to_date / incompatible_fw: nothing left to fetch, drop stale flags.
+    // a pasted link (a downgrade, say) still is
+    if (old && (g.manual_version ||
+        (g.status !== "up_to_date" && g.status !== "incompatible_fw"))) {
       if (old._autoInstalled) g._autoInstalled = true;
       if (old._localDownloading) g._localDownloading = true;
       if (old._wasActive) g._wasActive = true;
@@ -872,6 +875,8 @@ function primaryButton(game) {
   if (!hasPatch) return null;
   if (!isDownloadAllowed(game)) return null;
   const missing = isMissing(game);
+  if (game.manual_downgrade && state.config.install_after_download && isInstallAllowed(game))
+    return { label: t("btn.downgrade"), action: "update", variant: "update" };
   return state.config.install_after_download && isInstallAllowed(game)
     ? { label: t(missing ? "btn.install" : "btn.update"), action: "update", variant: "update", hint: missing ? "" : t("btn.updateHint") }
     : { label: t("btn.download"), action: "download", variant: "update", hint: missing ? "" : t("btn.downloadHint") };
@@ -894,7 +899,8 @@ function versionTrackHtml(game) {
   const step = (label, version, note, cls = "") => `
     <div class="vstep ${cls}"><span>${label}</span><b>${escapeHtml(version)}</b>${note ? `<em>${note}</em>` : ""}</div>`;
   const parts = [step(t("card.lblInstalled"), game.installed_version || "--", "")];
-  const target = t(isMissing(game) ? "card.lblInstall" : "card.lblUpdate");
+  const target = t(isMissing(game) ? "card.lblInstall"
+    : game.manual_downgrade ? "card.lblDowngrade" : "card.lblUpdate");
   let offered = "";
   if (game.manual_version) {
     offered = game.manual_version;
@@ -937,6 +943,7 @@ function statusPill(game) {
   if (game.patch_title_match === false) return `<span class="pill blocked">${t("pill.titleMismatch")}</span>`;
   // the badge says "get a link first", with a link it's a normal update
   if (isMissing(game)) return `<span class="pill">${t("pill.notInstalled")}</span>`;
+  if (game.manual_downgrade) return `<span class="pill ok">${t("pill.downgrade")}</span>`;
   if (game.manual_version || (hasOlderPatch(game) && hasSavedLink(game, game.prospero_version)))
     return `<span class="pill ok">${t("pill.available")}</span>`;
   if (hasOlderPatch(game))
@@ -1484,7 +1491,7 @@ async function saveConfig() {
 async function updateAll() {
   const targets = state.titles.filter((g) =>
     g.status === "available" && isInstallAllowed(g) && g.installed_version &&
-    !g.downloading && !g.downloaded);
+    !g.manual_downgrade && !g.downloading && !g.downloaded);
   if (!targets.length) {
     showToast(t("toast.noUpdates"));
     return;
@@ -1570,7 +1577,7 @@ async function doInstall(game, force = false, replace = false) {
       // it only goes on as the whole game, one question and the rest is the same
       game.installing = false;
       renderGames();
-      if (window.confirm(t("install.confirmReplace", { name: game.name })))
+      if (window.confirm(t(b.downgrade ? "install.confirmDowngrade" : "install.confirmReplace", { name: game.name })))
         return doInstall(game, force, true);
       return false;
     }
@@ -1937,6 +1944,15 @@ function canPickVersion(game, version) {
     isDownloadAllowed({ ...game, manual_version: version });
 }
 
+// older than installed: PS5 only, it goes on as the whole game
+function isOlder(game, version) {
+  return Boolean(game.installed_version) && version < game.installed_version;
+}
+
+function canDowngrade(game, version) {
+  return !isPs4(game) && isOlder(game, version) && canPickVersion(game, version);
+}
+
 function canGetOlderPatch(game) {
   return hasOlderPatch(game) &&
     !game.manual_version && !game.downloading && !game.downloaded &&
@@ -2145,6 +2161,7 @@ async function guideSubmit(url, force) {
   try {
     await postJson("/api/download_url", {
       title_id: game.title_id, url, version: pick.version, size: pick.size, force,
+      downgrade: isOlder(game, pick.version),
     });
   } catch (error) {
     guide.busy = false;
@@ -2189,7 +2206,8 @@ async function guideSubmit(url, force) {
 async function savedDownload(game, version, size, force = false) {
   if (!canPickVersion(game, version)) return;
   try {
-    await postJson("/api/download_url", { title_id: game.title_id, version, size, saved: true, force });
+    await postJson("/api/download_url", { title_id: game.title_id, version, size, saved: true, force,
+                                          downgrade: isOlder(game, version) });
   } catch (error) {
     const b = (error && error.body) || {};
     const pick = pickFor(game, version, size);
@@ -2220,6 +2238,7 @@ async function savedDownload(game, version, size, force = false) {
 
 function manualDownloadStarted(game, version) {
   game.manual_version = version;
+  game.manual_downgrade = isOlder(game, version);
   game.downloading = true;
   game._localDownloading = true;
   game._localSince = Date.now();
