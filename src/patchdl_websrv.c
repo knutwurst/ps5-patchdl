@@ -3641,6 +3641,54 @@ do_replace_install(struct MHD_Connection *conn, const char *title_id,
     return queue_json(conn, MHD_HTTP_ACCEPTED, "{\"ok\":true,\"replacing\":true}");
 }
 
+/* downloads from before 0.3.5 have no <name>.json: fetch Sony's manifest
+   again so the base check and the clean install have one. only when it
+   describes the pkg on disk to the byte. the network part runs unlocked,
+   publishing the files under g_cancel_mtx so no Install click, cancel or
+   new download writes them meanwhile */
+static void
+ensure_local_manifest(const char *title_id, const char *patch_url, const char *dest) {
+    char               json[340], crc[340], tmp[360], state[320], buf[8192];
+    size_t             n = strlen(dest);
+    struct stat        st, cst;
+    patchdl_manifest_t mf;
+    FILE              *f;
+    int                same, have_crc;
+
+    if (n < 5 || strcmp(dest + n - 4, ".pkg") || stat(dest, &st)) return;
+    snprintf(json, sizeof json, "%.*s.json", (int)(n - 4), dest);
+    snprintf(crc, sizeof crc, "%.*s.crc", (int)(n - 4), dest);
+    if (access(json, F_OK) == 0) return;
+    title_state_path(title_id, state, sizeof state);
+    if (!(f = fopen(state, "r"))) return;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    if (patchdl_fetch_manifest(patch_url, &mf)) return;
+    /* the link may have been saved in another spelling, size and pieces
+       tell whether it's the same pkg */
+    same = mf.total == (long long)st.st_size &&
+           json_get_ll(buf, "total", -1) == mf.total &&
+           json_get_int(buf, "piece_count", -1) == mf.count;
+    /* the manifest sends the console to <name>.crc at the end */
+    snprintf(tmp, sizeof tmp, "%s.%lx", crc, (unsigned long)(uintptr_t)pthread_self());
+    if (same && mf.crc_url[0] && (stat(crc, &cst) != 0 || cst.st_size == 0))
+        (void)patchdl_http_download(mf.crc_url, tmp, NULL);
+
+    pthread_mutex_lock(&g_cancel_mtx);
+    if (same && download_complete(title_id) && access(json, F_OK) != 0 &&
+        stat(dest, &st) == 0 && (long long)st.st_size == mf.total) {
+        if (stat(tmp, &cst) == 0 && cst.st_size > 0) rename(tmp, crc);
+        have_crc = stat(crc, &cst) == 0 && cst.st_size > 0;
+        /* without that file stay with the bare pkg */
+        if (!mf.crc_url[0] || have_crc)
+            write_local_manifest(dest, title_id, &mf);
+    }
+    pthread_mutex_unlock(&g_cancel_mtx);
+    unlink(tmp);
+    patchdl_manifest_free(&mf);
+}
+
 static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
            patchdl_source_t src, const char *patch_url, const char *delta_url,
@@ -3680,6 +3728,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
        by the console, it only goes on as the whole game. ask first */
     if (strncmp(title_id, "CUSA", 4) && url_is_manifest(patch_url)) {
         title_pkg_path(title_id, patch_url, dest, sizeof(dest));
+        ensure_local_manifest(title_id, patch_url, dest);
         if (update_fits_installed(title_id, dest) == 0) {
             char gdir[256] = "";
             if (!replace)
