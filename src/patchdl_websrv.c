@@ -1645,7 +1645,10 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
                 snprintf(patch_storage_title_id, pst_sz, "%.9s", title_id);
                 snprintf(version, ver_sz, "%s", g_titles[i].manual_version);
             }
-            *enabled = g_titles[i].enabled;
+            /* switched off keeps it out of updates, a pasted link still
+               goes. sideloads stay off until switched on */
+            *enabled = g_titles[i].enabled ||
+                       (manual_pending(&g_titles[i]) && !g_titles[i].sideloaded);
             found = 1;
             break;
         }
@@ -1904,6 +1907,20 @@ version_older(const char *title_id, const char *version) {
         }
     pthread_mutex_unlock(&g_mutex);
     return older;
+}
+
+/* sideloads stay off until switched on, a pasted link doesn't change that */
+static int
+title_sideloaded(const char *title_id) {
+    int side = 0;
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            side = g_titles[i].sideloaded;
+            break;
+        }
+    pthread_mutex_unlock(&g_mutex);
+    return side;
 }
 
 static long long
@@ -3973,7 +3990,8 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
                                cid, sizeof cid, tname, sizeof tname,
                                tv, sizeof tv, &en))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "unknown title");
-    if (!en)
+    /* the switch only keeps a game out of updates */
+    if (!en && title_sideloaded(tid))
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
             "{\"ok\":false,\"reason\":\"title_disabled\"}");
     if (src == PATCHDL_SOURCE_UNKNOWN || src == PATCHDL_SOURCE_FAKE ||
@@ -4050,7 +4068,7 @@ handle_download_url(struct MHD_Connection *conn, const char *body) {
                           "{\"ok\":false,\"reason\":\"already_installed\"}");
     save_manual_source(tid, canon, ver, down);
     set_manual_source(tid, canon, ver, down);
-    return do_download(conn, tid, src, canon, "", tname, ver, en);
+    return do_download(conn, tid, src, canon, "", tname, ver, 1);
 }
 
 

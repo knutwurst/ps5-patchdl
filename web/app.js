@@ -1490,7 +1490,7 @@ async function saveConfig() {
 // refuses anyway (no real source medium). double clicks are fine server side
 async function updateAll() {
   const targets = state.titles.filter((g) =>
-    g.status === "available" && isInstallAllowed(g) && g.installed_version &&
+    g.status === "available" && g.enabled !== false && isInstallAllowed(g) && g.installed_version &&
     !g.manual_downgrade && !g.downloading && !g.downloaded);
   if (!targets.length) {
     showToast(t("toast.noUpdates"));
@@ -1661,9 +1661,13 @@ function updateGame(titleId, patch) {
 /* policy */
 
 function isInstallBlocked(game) { return !sourcePolicy(game).allow_install; }
+// the switch keeps a game out of updates, a version picked by hand still goes
+function switchAllows(game) {
+  return game.enabled !== false || (Boolean(game.manual_version) && !game.sideloaded);
+}
 function isDownloadAllowed(game) {
   return Boolean(
-    game.enabled !== false &&
+    switchAllows(game) &&
     (game.compatible_version || game.manual_version) &&
     game.patch_title_match !== false &&
     sourcePolicy(game).allow_download
@@ -1671,7 +1675,7 @@ function isDownloadAllowed(game) {
 }
 function isInstallAllowed(game) {
   return Boolean(
-    game.enabled !== false &&
+    switchAllows(game) &&
     (game.compatible_version || game.manual_version) &&
     game.patch_title_match !== false &&
     sourcePolicy(game).allow_install
