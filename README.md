@@ -90,7 +90,7 @@ On PS5 games, yes. Older versions under Other versions have a Downgrade button. 
 Only after the console reports the new version and its installer has registered the package. Otherwise it stays. You can turn deleting off in Settings.
 
 **Do disc games work?**
-Yes. Keep the disc in the drive while the update installs.
+Yes. Keep the disc in the drive while the update installs. Some disc builds are older than the base the update expects. Then PatchDL asks once and installs the update as the whole game instead; your saves stay and the disc stays the license.
 
 **What if the power goes out during a download?**
 Start PatchDL again and press Resume.
