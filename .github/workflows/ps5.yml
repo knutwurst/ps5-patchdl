@@ -24,7 +24,9 @@ jobs:
   build:
     outputs:
       archive_name: ${{ steps.package.outputs.archive_name }}
-    runs-on: ubuntu-latest
+    # pinned: 26.04 ships pacman 7, which refuses the unsigned SDK packages
+    # built below
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout PatchDL
         uses: actions/checkout@v4
