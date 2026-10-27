@@ -9,4 +9,4 @@
 
 #pragma once
 
-#define PATCHDL_VERSION "0.3.8"
+#define PATCHDL_VERSION "0.3.9"
