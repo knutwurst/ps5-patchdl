@@ -21,6 +21,8 @@
 #include "patchdl_prospero.h"
 #include "patchdl_version.h"
 
+#include <ps5/kernel.h>
+
 #include <arpa/inet.h>
 #include <microhttpd.h>
 #include <netinet/in.h>
@@ -3979,6 +3981,285 @@ do_install(struct MHD_Connection *conn, const char *title_id,
     return start_install(conn, title_id, dest, version, content_id, name, can_replace);
 }
 
+/* /api/diag/<id>: everything PatchDL knows about one title and every file
+   of it on the drives, for consoles I can't look at (#24). read-only */
+#define DIAG_TEXT_MAX  8192
+#define DIAG_FILES_MAX 200
+#define DIAG_WALK_MAX  60000
+#define DIAG_HITS_MAX  24
+
+static int
+diag_text_name(const char *n) {
+    static const char *const ends[] = { ".json", ".xml", ".lnk", ".txt", ".tsv", NULL };
+    size_t l = strlen(n);
+    for (int i = 0; ends[i]; i++) {
+        size_t e = strlen(ends[i]);
+        if (l > e && !strcmp(n + l - e, ends[i])) return 1;
+    }
+    return 0;
+}
+
+/* a directory with every entry: stat, open result, small text files.
+   path is relative to root, or absolute */
+static void
+diag_dir(jbuf_t *j, int root, const char *path) {
+    struct stat    st;
+    struct dirent *de;
+    DIR           *d;
+    int            fd, n = 0;
+
+    jbuf_append(j, "{\"path\":");
+    jbuf_append_str(j, path);
+    if (fstatat(root, path, &st, 0)) {
+        jbuf_appendf(j, ",\"stat_errno\":%d}", errno);
+        return;
+    }
+    jbuf_appendf(j, ",\"mode\":\"%o\",\"uid\":%u,\"gid\":%u",
+                 (unsigned)st.st_mode, (unsigned)st.st_uid, (unsigned)st.st_gid);
+    if ((fd = openat(root, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0) {
+        jbuf_appendf(j, ",\"open_errno\":%d}", errno);
+        return;
+    }
+    if (!(d = fdopendir(fd))) {
+        jbuf_appendf(j, ",\"opendir_errno\":%d}", errno);
+        close(fd);
+        return;
+    }
+    jbuf_append(j, ",\"files\":[");
+    while ((de = readdir(d)) && n < DIAG_FILES_MAX) {
+        char        p[PATH_MAX], lnk[PATH_MAX];
+        struct stat fs;
+        ssize_t     ln;
+        int         ffd;
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        snprintf(p, sizeof p, "%s/%s", path, de->d_name);
+        jbuf_append(j, n++ ? ",{\"name\":" : "{\"name\":");
+        jbuf_append_str(j, de->d_name);
+        if (fstatat(root, p, &fs, AT_SYMLINK_NOFOLLOW)) {
+            jbuf_appendf(j, ",\"stat_errno\":%d}", errno);
+            continue;
+        }
+        jbuf_appendf(j, ",\"size\":%lld,\"mode\":\"%o\",\"uid\":%u,\"gid\":%u,\"mtime\":%lld",
+                     (long long)fs.st_size, (unsigned)fs.st_mode, (unsigned)fs.st_uid,
+                     (unsigned)fs.st_gid, (long long)fs.st_mtime);
+        if (S_ISLNK(fs.st_mode) && (ln = readlinkat(root, p, lnk, sizeof lnk - 1)) >= 0) {
+            lnk[ln] = '\0';
+            jbuf_append(j, ",\"link\":");
+            jbuf_append_str(j, lnk);
+        }
+        if (S_ISREG(fs.st_mode)) {
+            if ((ffd = openat(root, p, O_RDONLY | O_CLOEXEC)) < 0) {
+                jbuf_appendf(j, ",\"open_errno\":%d", errno);
+            } else {
+                if (diag_text_name(de->d_name) && fs.st_size <= DIAG_TEXT_MAX) {
+                    char    txt[DIAG_TEXT_MAX + 1];
+                    ssize_t r = read(ffd, txt, DIAG_TEXT_MAX);
+                    if (r < 0) {
+                        jbuf_appendf(j, ",\"read_errno\":%d", errno);
+                    } else {
+                        txt[r] = '\0';
+                        jbuf_append(j, ",\"text\":");
+                        jbuf_append_str(j, txt);
+                    }
+                }
+                close(ffd);
+            }
+        }
+        jbuf_append(j, "}");
+    }
+    closedir(d);
+    jbuf_append(j, "]}");
+}
+
+/* every name with the title id in it, a few levels down */
+static void
+diag_find(int root, const char *path, const char *tid, int depth, int *seen,
+          char hits[][PATH_MAX], int *nhits) {
+    struct dirent *de;
+    DIR           *d;
+    int            fd = openat(root, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (!(d = fdopendir(fd))) { close(fd); return; }
+    while ((de = readdir(d)) && *seen < DIAG_WALK_MAX) {
+        char        p[PATH_MAX];
+        struct stat st;
+        int         dir;
+        if (de->d_name[0] == '.') continue;
+        (*seen)++;
+        snprintf(p, sizeof p, "%s/%s", path, de->d_name);
+        if (strstr(de->d_name, tid)) {
+            if (*nhits < DIAG_HITS_MAX) snprintf(hits[(*nhits)++], PATH_MAX, "%s", p);
+            continue;
+        }
+        dir = de->d_type == DT_DIR ||
+              (de->d_type == DT_UNKNOWN && !fstatat(root, p, &st, AT_SYMLINK_NOFOLLOW) &&
+               S_ISDIR(st.st_mode));
+        if (dir && depth > 0) diag_find(root, p, tid, depth - 1, seen, hits, nhits);
+    }
+    closedir(d);
+}
+
+static char *
+build_diag_json(const char *tid) {
+    static const char *const bases[] = {
+        "user/app", "mnt/ext0/user/app", "mnt/ext1/user/app", "system_ex/app",
+        "user/patch", "mnt/ext0/user/patch", "mnt/ext1/user/patch",
+        "user/appmeta", "mnt/ext0/user/appmeta", "mnt/ext1/user/appmeta", NULL,
+    };
+    static const char *const roots[] = {
+        "user", "mnt/ext0", "mnt/ext1", "mnt/usb0", "mnt/usb1", "system_data", NULL,
+    };
+    static char       hits[DIAG_HITS_MAX][PATH_MAX];
+    static pthread_mutex_t diag_mtx = PTHREAD_MUTEX_INITIALIZER;
+    jbuf_t            j = {0};
+    int               root = patchdl_scan_root_fd(), seen = 0, nhits = 0;
+    char              path[PATH_MAX], ver[16] = "", file[160] = "", dir[288], why[96];
+    char              *aj, inst[1024];
+    long long         total = 0;
+    pkg_origin_t      o;
+
+    jbuf_appendf(&j, "{\"patchdl\":\"%s\",\"fw\":\"%s\",\"uid\":%u,\"euid\":%u,"
+                 "\"authid\":\"0x%016llx\",\"root_fd\":%d,\"now\":%lld",
+                 PATCHDL_VERSION, g_fw.str, (unsigned)getuid(), (unsigned)geteuid(),
+                 (unsigned long long)kernel_get_ucred_authid(getpid()), root,
+                 (long long)time(NULL));
+
+    pthread_mutex_lock(&g_mutex);
+    jbuf_append(&j, ",\"title\":");
+    {
+        const patchdl_title_t *t = NULL;
+        for (size_t i = 0; i < g_title_count && !t; i++)
+            if (!strcmp(g_titles[i].title_id, tid)) t = &g_titles[i];
+        if (!t) {
+            jbuf_append(&j, "null");
+        } else {
+            jbuf_append(&j, "{\"name\":");          jbuf_append_str(&j, t->name);
+            jbuf_append(&j, ",\"content_id\":");    jbuf_append_str(&j, t->content_id);
+            jbuf_append(&j, ",\"installed\":");     jbuf_append_str(&j, t->installed_version);
+            jbuf_append(&j, ",\"compatible\":");    jbuf_append_str(&j, t->compatible_version);
+            jbuf_append(&j, ",\"latest\":");        jbuf_append_str(&j, t->latest_version);
+            jbuf_append(&j, ",\"source\":");        jbuf_append_str(&j, patchdl_source_str(t->source_type));
+            jbuf_append(&j, ",\"source_path\":");   jbuf_append_str(&j, t->source_path);
+            jbuf_append(&j, ",\"mount_from\":");    jbuf_append_str(&j, t->mount_from);
+            jbuf_append(&j, ",\"patch_url\":");     jbuf_append_str(&j, t->patch_url);
+            jbuf_append(&j, ",\"manual_url\":");    jbuf_append_str(&j, t->manual_url);
+            jbuf_append(&j, ",\"manual_version\":"); jbuf_append_str(&j, t->manual_version);
+            jbuf_appendf(&j, ",\"manual_down\":%d,\"enabled\":%d,\"sideloaded\":%d,"
+                         "\"builtin\":%d,\"downloaded\":%d,\"resumable\":%d}",
+                         t->manual_down, t->enabled, t->sideloaded, t->builtin,
+                         t->downloaded, t->resumable);
+        }
+    }
+    jbuf_append(&j, ",\"stream\":");
+    {
+        const install_stream_t *st = stream_find(tid);
+        if (!st) {
+            jbuf_append(&j, "null");
+        } else {
+            time_t now = time(NULL);
+            snprintf(ver, sizeof ver, "%s", st->version);
+            snprintf(file, sizeof file, "%s", st->file);
+            total = st->total;
+            jbuf_appendf(&j, "{\"version\":\"%s\",\"read\":%lld,\"total\":%lld,\"crc\":%d,"
+                         "\"started_ago\":%lld,\"idle\":%lld,\"phase\":\"%s\",\"checked\":%d,"
+                         "\"verified\":%d,\"deleted\":%d,\"claiming\":%d,\"failed\":%d,"
+                         "\"not_removed\":%d,\"can_replace\":%d,\"spans\":%d,\"file\":",
+                         st->version, st->read, st->total, st->crc,
+                         (long long)(now - st->started), (long long)(now - st->last),
+                         stream_phase(st, now), st->checked, st->verified, st->deleted,
+                         st->claiming, st->failed, st->not_removed, st->can_replace,
+                         st->nspans);
+            jbuf_append_str(&j, st->file);
+            jbuf_append(&j, ",\"note\":");
+            jbuf_append_str(&j, st->note);
+            jbuf_append(&j, "}");
+        }
+    }
+    jbuf_append(&j, ",\"pkg_log\":[");
+    for (unsigned i = 0, k = 0; i < PKG_LOG_LINES; i++) {
+        const char *l = g_pkg_log[(g_pkg_log_next + i) % PKG_LOG_LINES];
+        if (!l[0]) continue;
+        if (k++) jbuf_append(&j, ",");
+        jbuf_append_str(&j, l);
+    }
+    jbuf_append(&j, "]");
+    pthread_mutex_unlock(&g_mutex);
+
+    patchdl_install_status_json(inst, sizeof inst);
+    jbuf_append(&j, ",\"installer\":");
+    jbuf_append(&j, inst[0] == '{' ? inst : "null");
+
+    /* what the install check and the replace look at */
+    aj = malloc(APP_JSON_MAX);
+    {
+        int rc = aj ? patchdl_scan_read_app_file(tid, "app.json", aj, APP_JSON_MAX) : -1;
+        char size_key[48];
+        snprintf(size_key, sizeof size_key, "\"originalFileSize\":%lld", total);
+        jbuf_appendf(&j, ",\"checks\":{\"app_installed\":%d,\"patch_size\":%lld,"
+                     "\"app_json_rc\":%d,\"app_json_has_file\":%s,\"app_json_has_size\":%s,"
+                     "\"version_installed\":%s",
+                     patchdl_scan_app_installed(tid), patchdl_scan_patch_size(tid), rc,
+                     !rc && file[0] && strstr(aj, file) ? "true" : "false",
+                     !rc && total > 0 && strstr(aj, size_key) ? "true" : "false",
+                     ver[0] && version_installed(tid, ver) ? "true" : "false");
+        jbuf_append(&j, ",\"installed_base\":");
+        jbuf_append_str(&j, installed_origin(tid, &o, why, sizeof why) ? why : o.content);
+        jbuf_append(&j, "}");
+    }
+    free(aj);
+
+    /* the process' own view, without the kept root */
+    jbuf_append(&j, ",\"proc_view\":[");
+    for (int i = 0; i < 3; i++) {
+        struct stat st;
+        snprintf(path, sizeof path, "/%s/%s/app.json", bases[i], tid);
+        jbuf_append(&j, i ? ",{\"path\":" : "{\"path\":");
+        jbuf_append_str(&j, path);
+        jbuf_appendf(&j, ",\"errno\":%d}", stat(path, &st) ? errno : 0);
+    }
+    jbuf_append(&j, "]");
+
+    jbuf_append(&j, ",\"dirs\":[");
+    for (int i = 0; bases[i]; i++) {
+        snprintf(path, sizeof path, "%s/%s", bases[i], tid);
+        if (i) jbuf_append(&j, ",");
+        if (root < 0) jbuf_append(&j, "null");
+        else diag_dir(&j, root, path);
+    }
+    title_dir(tid, dir, sizeof dir);
+    jbuf_append(&j, ",");
+    diag_dir(&j, AT_FDCWD, dir);
+    jbuf_append(&j, "]");
+
+    /* anything else named after the title. one walk at a time, hits is static */
+    pthread_mutex_lock(&diag_mtx);
+    for (int i = 0; roots[i] && root >= 0; i++)
+        diag_find(root, roots[i], tid, 3, &seen, hits, &nhits);
+    jbuf_appendf(&j, ",\"walked\":%d,\"found\":[", seen);
+    for (int i = 0; i < nhits; i++) {
+        if (i) jbuf_append(&j, ",");
+        jbuf_append_str(&j, hits[i]);
+    }
+    jbuf_append(&j, "],\"found_dirs\":[");
+    for (int i = 0, k = 0; i < nhits; i++) {
+        struct stat st;
+        int         listed = 0;
+        for (int b = 0; bases[b] && !listed; b++) {
+            snprintf(path, sizeof path, "%s/%s", bases[b], tid);
+            listed = !strcmp(path, hits[i]);
+        }
+        /* saves are the user's business, the path is enough */
+        if (listed || !strncmp(hits[i], "user/home/", 10) ||
+            fstatat(root, hits[i], &st, 0) || !S_ISDIR(st.st_mode))
+            continue;
+        if (k++) jbuf_append(&j, ",");
+        diag_dir(&j, root, hits[i]);
+    }
+    pthread_mutex_unlock(&diag_mtx);
+    jbuf_append(&j, "]}");
+    return j.buf;
+}
+
 /* Prospero link to Sony's manifest (<name>.json next to <name>_sc.pkg
    and .crc). NULL on success, else a reason for the UI */
 static const char *
@@ -4771,6 +5052,15 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
                  msg, ri ? wi : bi, rp ? wp : bp,
                  ri || rp ? "null" : !strcmp(bi, bp) ? "true" : "false");
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+    }
+
+    if (!strncmp(url, "/api/diag/", 10)) {
+        char *out;
+        if (!path_segment_safe(url + 10) || strlen(url + 10) != 9)
+            return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
+        if (!(out = build_diag_json(url + 10)))
+            return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
+        return queue_json_owned(conn, MHD_HTTP_OK, out);
     }
 
     if (!strcmp(url, "/api/drives"))

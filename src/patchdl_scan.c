@@ -638,6 +638,11 @@ patchdl_scan_sys_statvfs(const char *path, struct statvfs *out) {
 }
 
 int
+patchdl_scan_root_fd(void) {
+    return g_sysroot_fd;
+}
+
+int
 patchdl_scan_read_app_file(const char *title_id, const char *name,
                            char *buf, size_t sz) {
     return read_title_file(SCAN_DIRS, title_id, name, buf, sz);
