@@ -4907,6 +4907,75 @@ add_builtin_titles(patchdl_title_t **arr, size_t *cnt) {
     }
 }
 
+/* a finished PS5 download whose game is gone, say a replace that lost the
+   game on the way (#24). a PS5 pkg is the whole game, so it's offered for
+   install. the pasted version wins through manual.json */
+static void
+add_orphan_downloads(patchdl_title_t **arr, size_t *cnt) {
+    char           drives[MAX_DRIVES][32], root[64], dir[288], state[320], buf[8192];
+    char           url[512], ver[16], dest[320], icon[320];
+    int            nd = list_drives(drives, MAX_DRIVES);
+    DIR           *d;
+    struct dirent *de;
+    struct stat    pst;
+
+    for (int k = 0; k < nd; k++) {
+        snprintf(root, sizeof root, "%s/patchdl", drives[k]);
+        if (!(d = opendir(root))) continue;
+        while ((de = readdir(d))) {
+            patchdl_title_t *grown, *t;
+            FILE            *f;
+            size_t           n;
+            long long        total;
+            int              known = 0;
+
+            if (!is_title_dir_name(de->d_name) || !strncmp(de->d_name, "CUSA", 4)) continue;
+            for (size_t i = 0; i < *cnt && !known; i++)
+                known = !strcmp((*arr)[i].title_id, de->d_name);
+            pthread_mutex_lock(&g_mutex);
+            for (int h = 0; h < g_held_n && !known; h++)
+                known = !strcmp(g_held[h].title_id, de->d_name);
+            pthread_mutex_unlock(&g_mutex);
+            /* appmeta goes with the uninstall. still there: the game sits on
+               a drive that isn't plugged in */
+            snprintf(icon, sizeof icon, "/user/appmeta/%s", de->d_name);
+            if (known || !stat(icon, &pst)) continue;
+            snprintf(dir, sizeof dir, "%s/%s", root, de->d_name);
+            snprintf(state, sizeof state, "%s/state.json", dir);
+            if (!(f = fopen(state, "r"))) continue;
+            n = fread(buf, 1, sizeof buf - 1, f);
+            fclose(f);
+            buf[n] = '\0';
+            total = json_get_ll(buf, "total", 0);
+            json_get_str(buf, "manifest_url", url, sizeof url);
+            json_get_str(buf, "version", ver, sizeof ver);
+            if (!url_is_manifest(url) || !ver[0] || total <= 0 ||
+                json_get_ll(buf, "done_bytes", 0) < total)
+                continue;
+            title_pkg_path(de->d_name, url, dest, sizeof dest);
+            if (stat(dest, &pst) || (long long)pst.st_size != total) continue;
+            if (!(grown = realloc(*arr, (*cnt + 1) * sizeof **arr))) break;
+            *arr = grown;
+            t = &grown[(*cnt)++];
+            memset(t, 0, sizeof *t);
+            snprintf(t->title_id, sizeof t->title_id, "%s", de->d_name);
+            json_get_str(buf, "name", t->name, sizeof t->name);
+            if (!t->name[0]) snprintf(t->name, sizeof t->name, "%s", de->d_name);
+            snprintf(t->manual_url, sizeof t->manual_url, "%s", url);
+            snprintf(t->manual_version, sizeof t->manual_version, "%s", ver);
+            /* no content id, the installer takes it from the pkg */
+            t->source_type = PATCHDL_SOURCE_OFFICIAL;
+            t->pkg_sign    = PATCHDL_PKG_NONE;
+            t->enabled     = 1;
+            /* the replace put the pkg's own cover next to it */
+            snprintf(icon, sizeof icon, "%s/icon0.png", dir);
+            if ((t->icon_fd = open(icon, O_RDONLY)) < 0)
+                t->icon_fd = open_cached_cover(t->title_id);
+        }
+        closedir(d);
+    }
+}
+
 /* update info only carries over with same version/content id, no refresh */
 static void
 carry_title_state(patchdl_title_t *dst, const patchdl_title_t *src, int recheck) {
@@ -4951,6 +5020,7 @@ rescan_titles(int recheck) {
     g_rescan_step  = "scan";
     if (patchdl_scan(&arr, &cnt)) { g_rescan_step = "scan failed"; return -1; }
     add_builtin_titles(&arr, &cnt);
+    add_orphan_downloads(&arr, &cnt);
     t1 = mono_ms();
     g_rescan_step = "policy";
     apply_title_policy(arr, cnt);
@@ -5181,6 +5251,7 @@ patchdl_websrv_start(unsigned short port) {
     if (patchdl_scan(&g_titles, &g_title_count))
         g_title_count = 0;
     add_builtin_titles(&g_titles, &g_title_count);
+    add_orphan_downloads(&g_titles, &g_title_count);
 
     /* default: unknown sources off, then the saved config on top */
     for (size_t i = 0; i < g_title_count; i++)

@@ -86,6 +86,9 @@ Open Other versions on the game, pick a version and follow the steps. You copy o
 **Can I go back to an older version?**
 Yes. Older versions under Other versions have a Downgrade button. A PS5 update contains the whole game, so PatchDL removes the installed game and puts the older version on. A PS4 patch builds on the base game, so PatchDL removes only the installed patch and puts the older one on; the game stays. Your saves stay either way, but a save made with the newer version may not load in the older one. Turn off updates for that game afterwards, or Update all brings it back to the newest version.
 
+**The game is gone, but its download is still there?**
+PatchDL lists a finished PS5 download whose game isn't installed anymore, for example after a replace that stopped halfway. Press Install and it goes on as the whole game.
+
 **When is the package deleted?**
 Only after the console reports the new version and its installer has registered the package. Otherwise it stays. You can turn deleting off in Settings.
 
