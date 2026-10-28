@@ -4852,7 +4852,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     }
 
     if (!strcmp(url, "/api/installstatus")) {
-        char   p[1024], streams[MAX_STREAMS * 560 + 32];
+        char   p[1024], streams[MAX_STREAMS * 580 + 32];
         size_t pl, sl = 0;
         time_t now = time(NULL);
         patchdl_install_status_json(p, sizeof(p));
@@ -4866,13 +4866,14 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             sl += (size_t)snprintf(streams + sl, sizeof streams - sl,
                      "%s{\"title_id\":\"%s\",\"read\":%lld,\"total\":%lld,"
                      "\"crc\":%s,\"idle_secs\":%lld,\"phase\":\"%s\","
-                     "\"verified\":%s,\"deleted\":%s,\"not_removed\":%s,"
+                     "\"verified\":%s,\"deleted\":%s,\"kept\":%s,\"not_removed\":%s,"
                      "\"refused\":%s,\"can_replace\":%s,\"note\":\"%s\"}",
                      n++ ? "," : "", st->title_id, st->read, st->total,
                      st->crc ? "true" : "false", (long long)(now - st->last),
                      stream_phase(st, now),
                      st->verified > 0 ? "true" : !st->checked ? "null" : "false",
                      st->deleted ? "true" : "false",
+                     st->checked && st->verified > 0 && !st->deleted ? "true" : "false",
                      st->not_removed ? "true" : "false",
                      refused ? "true" : "false",
                      refused && st->can_replace ? "true" : "false", st->note);
@@ -5364,7 +5365,10 @@ rescan_titles(int recheck) {
     return 0;
 }
 
-#define POST_INSTALL_GIVE_UP (15 * 60)
+/* tested installs registered their version within a minute or two of
+   the last byte, 15 minutes only kept the card on finishing */
+#define POST_INSTALL_GIVE_UP (5 * 60)
+#define VERSION_ONLY_SECS    (2 * 60)
 
 /* did the install really take this pkg? version and app.json (the file
    and size) must both say so */
@@ -5374,7 +5378,8 @@ check_one_install(int idx) {
     char             *aj;
     long long         total, idle;
     time_t            last;
-    int               del, ok, deleted = 0, settle;
+    int               del, ok, ver_only, deleted = 0, settle, ver_ok, rc = -1;
+    int               has_file = 0, has_size = 0;
     install_stream_t *st;
 
     pthread_mutex_lock(&g_mutex);
@@ -5399,12 +5404,21 @@ check_one_install(int idx) {
     aj = malloc(256 * 1024);
     /* a PS5 update replaces app.pkg (app.json), a PS4 patch lands in
        /user/patch/<id>/ (patch.json) */
-    ok = aj && version_installed(tid, ver) && file[0] &&
-         (strncmp(tid, "CUSA", 4)
-              ? patchdl_scan_read_app_file(tid, "app.json", aj, 256 * 1024)
-              : patchdl_scan_read_patch_file(tid, "patch.json", aj, 256 * 1024)) == 0 &&
-         strstr(aj, file) && strstr(aj, size_key);
+    ver_ok = version_installed(tid, ver);
+    if (aj && file[0])
+        rc = strncmp(tid, "CUSA", 4)
+                 ? patchdl_scan_read_app_file(tid, "app.json", aj, 256 * 1024)
+                 : patchdl_scan_read_patch_file(tid, "patch.json", aj, 256 * 1024);
+    if (!rc) {
+        has_file = strstr(aj, file) != NULL;
+        has_size = strstr(aj, size_key) != NULL;
+    }
+    ok = ver_ok && has_file && has_size;
     free(aj);
+    /* the console switches the version only once the install completes, so
+       when app.json can't be read (M.2, #24) the version alone counts after
+       two minutes. weaker proof, so the pkg stays */
+    ver_only = !ok && ver_ok && rc && idle >= VERSION_ONLY_SECS;
     /* verified early: the card can say so, the pkg waits until the console
        has been quiet for a bit in case it reads once more. every byte served:
        the short settle (Ghostwire read nothing after its last byte), else the
@@ -5424,13 +5438,25 @@ check_one_install(int idx) {
     }
 
     /* the console may register the version a while after the last
-       request, so keep trying for 15 minutes */
-    if (!ok && idle < POST_INSTALL_GIVE_UP)
+       request, so keep trying for a few minutes */
+    if (!ok && !ver_only && idle < POST_INSTALL_GIVE_UP)
         return;
+    if (!ok) {
+        char note[200];
+        snprintf(note, sizeof note,
+                 "%s %s %s: version %s, %s %s", tid, ver,
+                 ver_only ? "confirmed by version only" : "not confirmed",
+                 ver_ok ? "on" : "not on", strncmp(tid, "CUSA", 4) ? "app.json" : "patch.json",
+                 rc ? "unreadable" : !has_file ? "names another pkg" : "has another size");
+        if (rc && patchdl_scan_read_errno())
+            snprintf(note + strlen(note), sizeof note - strlen(note), " (last read errno %d)",
+                     patchdl_scan_read_errno());
+        pkg_log_note(note);
+    }
     pthread_mutex_lock(&g_mutex);
     if ((st = stream_find(tid))) {     /* the entry may have been reused */
         st->checked  = 1;
-        st->verified = ok ? 1 : -1;
+        st->verified = ok || ver_only ? 1 : -1;
         st->deleted  = deleted;
     }
     pthread_mutex_unlock(&g_mutex);

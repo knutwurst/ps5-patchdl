@@ -1147,7 +1147,7 @@ function installEndText(st) {
   }
   if (!st.verified) return t("install.msg.unconfirmed");
   return t(st.deleted ? "install.msg.verifiedDeleted"
-    : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
+    : !st.kept && state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
     : "install.msg.verifiedKept");
 }
 
