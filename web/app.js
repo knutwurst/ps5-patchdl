@@ -1141,7 +1141,10 @@ function stopInstallPolling() {
 }
 
 function installEndText(st) {
-  if (st.phase === "stalled") return t(st.not_removed ? "install.msg.notRemoved" : "install.msg.stalled");
+  if (st.phase === "stalled") {
+    return t(st.not_removed ? "install.msg.notRemoved"
+      : st.can_replace ? "install.msg.refused" : "install.msg.stalled");
+  }
   if (!st.verified) return t("install.msg.unconfirmed");
   return t(st.deleted ? "install.msg.verifiedDeleted"
     : state.config.delete_pkg_after_install ? "install.msg.verifiedDeleting"
@@ -1603,7 +1606,8 @@ async function doInstall(game, force = false, replace = false) {
       // it only goes on as the whole game, one question and the rest is the same
       game.installing = false;
       renderGames();
-      const ask = !b.downgrade ? "install.confirmReplace"
+      const ask = b.refused ? "install.confirmReplaceRefused"
+        : !b.downgrade ? "install.confirmReplace"
         : b.ps4 ? "install.confirmDowngradePs4" : "install.confirmDowngrade";
       if (window.confirm(t(ask, { name: game.name })))
         return doInstall(game, force, true);

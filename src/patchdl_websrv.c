@@ -111,6 +111,7 @@ typedef struct {
     int       failed;      /* never got going (replace whose install failed) */
     int       not_removed; /* replace: the console kept the old version */
     char      note[200];   /* replace: what each removal try did */
+    int       can_replace; /* turned down: Install again offers the whole game */
 } install_stream_t;
 
 #define MAX_STREAMS 8
@@ -147,13 +148,24 @@ stream_find(const char *title_id) {
     return NULL;
 }
 
+/* PS5: the console read the header and the .crc and nothing more. it turned
+   the package down before copying anything, and says nothing (#20) */
+#define REFUSED_MAX_READ   (16LL << 20)
+#define REFUSED_QUIET_SECS 120
+
+static int
+stream_header_only(const install_stream_t *st) {
+    return strncmp(st->title_id, "CUSA", 4) && st->crc &&
+           st->total > REFUSED_MAX_READ && st->read < REFUSED_MAX_READ;
+}
+
 /* all bytes out, or .crc fetched plus a quiet minute. the .crc alone proves
    nothing, I've seen it fetched at 88%. g_mutex held */
 static int
 stream_read_all(const install_stream_t *st) {
     int quiet = time(NULL) - st->last >= INSTALL_QUIET_SECS;
     return (st->total > 0 && st->read >= st->total) ||
-           (st->crc && quiet) ||
+           (st->crc && quiet && !stream_header_only(st)) ||
            /* PS4 patches come without a .crc */
            (!strncmp(st->title_id, "CUSA", 4) && st->read > 0 && quiet);
 }
@@ -181,6 +193,7 @@ stream_phase(const install_stream_t *st, time_t now) {
     int read_all = stream_read_all(st);
     if (st->failed) return "stalled";
     if (st->claiming) return "waiting";   /* a replace may wait on the uninstall */
+    if (stream_header_only(st) && now - st->last >= REFUSED_QUIET_SECS) return "stalled";
     if (!read_all && now - st->last >= INSTALL_STALL_SECS) return "stalled";
     if (!read_all) return st->read ? "reading" : "waiting";
     /* verified counts as done for the card, the pkg may wait a bit longer */
@@ -3290,16 +3303,27 @@ sc_offset_from_json(const char *j) {
 #define ORIGIN_BLOCK (64 * 1024)
 #define APP_JSON_MAX (256 * 1024)
 
+/* the installed game's base, from the _sc part of app.pkg. appmeta's
+   param.json is no help: a patched game's names no base. 0, else why */
 static int
-installed_origin(const char *title_id, pkg_origin_t *o) {
+installed_origin(const char *title_id, pkg_origin_t *o, char *why, size_t wsz) {
     char     *aj = malloc(APP_JSON_MAX), *blk = malloc(ORIGIN_BLOCK);
     long long off;
     ssize_t   n;
     int       rc = -1;
-    if (aj && blk && patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX) == 0 &&
-        (off = sc_offset_from_json(aj)) >= 0 &&
-        (n = patchdl_scan_read_app_range(title_id, "app.pkg", off, blk, ORIGIN_BLOCK)) > 0)
-        rc = origin_from_block(blk, (size_t)n, o);
+    memset(o, 0, sizeof *o);
+    if (!aj || !blk)
+        snprintf(why, wsz, "out of memory");
+    else if (patchdl_scan_read_app_file(title_id, "app.json", aj, APP_JSON_MAX))
+        snprintf(why, wsz, "no app.json");
+    else if ((off = sc_offset_from_json(aj)) < 0)
+        snprintf(why, wsz, "no _sc piece in app.json");
+    else if ((n = patchdl_scan_read_app_range(title_id, "app.pkg", off, blk, ORIGIN_BLOCK)) <= 0)
+        snprintf(why, wsz, "app.pkg unreadable");
+    else if (origin_from_block(blk, (size_t)n, o))
+        snprintf(why, wsz, "no base in app.pkg");
+    else
+        rc = 0;
     free(aj);
     free(blk);
     return rc;
@@ -3307,23 +3331,32 @@ installed_origin(const char *title_id, pkg_origin_t *o) {
 
 /* the downloaded pkg, through the local manifest next to it */
 static int
-package_origin(const char *dest, pkg_origin_t *o) {
+package_origin(const char *dest, pkg_origin_t *o, char *why, size_t wsz) {
     char      path[360], *mj = malloc(APP_JSON_MAX), *blk = malloc(ORIGIN_BLOCK);
     size_t    n = strlen(dest), got;
     long long off;
     ssize_t   r;
     FILE     *f;
     int       fd, rc = -1;
+    memset(o, 0, sizeof *o);
+    snprintf(why, wsz, "out of memory");
     if (!mj || !blk || n < 5 || strcmp(dest + n - 4, ".pkg")) goto out;
     snprintf(path, sizeof path, "%.*s.json", (int)(n - 4), dest);
-    if (!(f = fopen(path, "r"))) goto out;
+    if (!(f = fopen(path, "r"))) {
+        snprintf(why, wsz, "no local manifest");
+        goto out;
+    }
     got = fread(mj, 1, APP_JSON_MAX - 1, f);
     fclose(f);
     mj[got] = '\0';
-    if ((off = sc_offset_from_json(mj)) < 0 || (fd = open(dest, O_RDONLY)) < 0) goto out;
+    snprintf(why, wsz, "no _sc piece in the manifest");
+    if ((off = sc_offset_from_json(mj)) < 0) goto out;
+    snprintf(why, wsz, "pkg unreadable");
+    if ((fd = open(dest, O_RDONLY)) < 0) goto out;
     r = pread(fd, blk, ORIGIN_BLOCK, (off_t)off);
     close(fd);
-    if (r > 0) rc = origin_from_block(blk, (size_t)r, o);
+    snprintf(why, wsz, "no base in the pkg");
+    if (r > 0 && !origin_from_block(blk, (size_t)r, o)) rc = 0;
 out:
     free(mj);
     free(blk);
@@ -3334,8 +3367,24 @@ out:
 static int
 update_fits_installed(const char *title_id, const char *dest) {
     pkg_origin_t inst, pkg;
-    if (installed_origin(title_id, &inst) || package_origin(dest, &pkg)) return -1;
+    char         why[96];
+    if (installed_origin(title_id, &inst, why, sizeof why) ||
+        package_origin(dest, &pkg, why, sizeof why))
+        return -1;
     return !strcmp(inst.content, pkg.content) && !strcmp(inst.master, pkg.master);
+}
+
+/* this version went to the console, which turned it down after the header */
+static int
+install_refused(const char *title_id, const char *version) {
+    const install_stream_t *st;
+    int                     refused;
+    pthread_mutex_lock(&g_mutex);
+    st = stream_find(title_id);
+    refused = st && !strcmp(st->version, version) && stream_header_only(st) &&
+              !strcmp(stream_phase(st, time(NULL)), "stalled");
+    pthread_mutex_unlock(&g_mutex);
+    return refused;
 }
 
 /* claim the title's install entry, one per title so a second tab or a double
@@ -3429,7 +3478,8 @@ launch_install(struct MHD_Connection *conn, install_stream_t *st, const char *ti
 
 static enum MHD_Result
 start_install(struct MHD_Connection *conn, const char *title_id, const char *dest,
-              const char *version, const char *content_id, const char *name) {
+              const char *version, const char *content_id, const char *name,
+              int can_replace) {
     install_stream_t *st = NULL;
     const char       *reason = claim_install(title_id, dest, version, 0, &st);
     char              resp[96];
@@ -3437,6 +3487,9 @@ start_install(struct MHD_Connection *conn, const char *title_id, const char *des
         snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}", reason);
         return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
     }
+    pthread_mutex_lock(&g_mutex);
+    st->can_replace = can_replace;
+    pthread_mutex_unlock(&g_mutex);
     return launch_install(conn, st, title_id, dest, content_id, name);
 }
 
@@ -3818,6 +3871,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
            const char *content_id, const char *name, const char *version,
            int enabled, int force, int replace) {
     char dest[320], resp[720];
+    int  can_replace = 0;
 
     if (!enabled)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
@@ -3848,21 +3902,28 @@ do_install(struct MHD_Connection *conn, const char *title_id,
 
     /* PS5: an update on another base than the installed game is turned down
        by the console, it only goes on as the whole game. same for an older
-       version. ask first */
+       version. ask first. when the bases can't be read, the console's own
+       answer decides: it turned this package down after the header */
     if (strncmp(title_id, "CUSA", 4) && url_is_manifest(patch_url)) {
-        int down = version_older(title_id, version);
+        int down = version_older(title_id, version), fits = 1, refused, there;
         title_pkg_path(title_id, patch_url, dest, sizeof(dest));
         ensure_local_manifest(title_id, patch_url, dest);
-        if (down || update_fits_installed(title_id, dest) == 0) {
+        if (!down) fits = update_fits_installed(title_id, dest);
+        there   = patchdl_scan_app_installed(title_id) == 1;
+        refused = fits < 0 && there && install_refused(title_id, version);
+        if (down || fits == 0 || refused) {
             char gdir[256] = "";
             if (!replace)
                 return queue_json(conn, MHD_HTTP_CONFLICT, down
                     ? "{\"ok\":false,\"reason\":\"needs_reinstall\",\"downgrade\":true}"
+                    : refused
+                    ? "{\"ok\":false,\"reason\":\"needs_reinstall\",\"refused\":true}"
                     : "{\"ok\":false,\"reason\":\"needs_reinstall\"}");
             title_game_dir(title_id, gdir, sizeof gdir);
             return do_replace_install(conn, title_id, dest, version, name, gdir,
                                       NULL, force, 0);
         }
+        can_replace = fits < 0 && there;
     }
 
     /* PS4: every patch builds on the base game, so an older one goes on once
@@ -3915,7 +3976,7 @@ do_install(struct MHD_Connection *conn, const char *title_id,
        AppInstallPkg only writes metadata, so InstallByPackage via /api/pkg */
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    return start_install(conn, title_id, dest, version, content_id, name);
+    return start_install(conn, title_id, dest, version, content_id, name, can_replace);
 }
 
 /* Prospero link to Sony's manifest (<name>.json next to <name>_sc.pkg
@@ -4510,7 +4571,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     }
 
     if (!strcmp(url, "/api/installstatus")) {
-        char   p[1024], streams[MAX_STREAMS * 520 + 32];
+        char   p[1024], streams[MAX_STREAMS * 560 + 32];
         size_t pl, sl = 0;
         time_t now = time(NULL);
         patchdl_install_status_json(p, sizeof(p));
@@ -4518,18 +4579,22 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         pthread_mutex_lock(&g_mutex);
         for (int i = 0, n = 0; i < MAX_STREAMS; i++) {
             const install_stream_t *st = &g_streams[i];
+            int                     refused;
             if (!st->title_id[0]) continue;
+            refused = stream_header_only(st) && !strcmp(stream_phase(st, now), "stalled");
             sl += (size_t)snprintf(streams + sl, sizeof streams - sl,
                      "%s{\"title_id\":\"%s\",\"read\":%lld,\"total\":%lld,"
                      "\"crc\":%s,\"idle_secs\":%lld,\"phase\":\"%s\","
                      "\"verified\":%s,\"deleted\":%s,\"not_removed\":%s,"
-                     "\"note\":\"%s\"}",
+                     "\"refused\":%s,\"can_replace\":%s,\"note\":\"%s\"}",
                      n++ ? "," : "", st->title_id, st->read, st->total,
                      st->crc ? "true" : "false", (long long)(now - st->last),
                      stream_phase(st, now),
                      st->verified > 0 ? "true" : !st->checked ? "null" : "false",
                      st->deleted ? "true" : "false",
-                     st->not_removed ? "true" : "false", st->note);
+                     st->not_removed ? "true" : "false",
+                     refused ? "true" : "false",
+                     refused && st->can_replace ? "true" : "false", st->note);
             if (sl >= sizeof streams) sl = sizeof streams - 1;
         }
         pthread_mutex_unlock(&g_mutex);
@@ -4669,9 +4734,11 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         const char      *tid = url + 13;
         char             purl[768] = {0}, durl_[512] = {0};
         char             pti[32], psti[32], cid[64], nm[128], ver[16];
-        char             dest[320], ecid[64] = {0}, etid[48] = {0}, msg[128], resp[900];
+        char             dest[320], ecid[64] = {0}, etid[48] = {0}, msg[128], resp[1200];
+        char             wi[96], wp[64], bi[32], bp[32];
+        pkg_origin_t     oi, op;
         patchdl_source_t src;
-        int              en, is_app = 0, rc;
+        int              en, is_app = 0, rc, ri, rp;
 
         if (!path_segment_safe(tid))
             return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
@@ -4684,18 +4751,25 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         title_pkg_path(tid, purl, dest, sizeof dest);
         rc = patchdl_install_pkg_meta(dest, ecid, sizeof ecid, etid, sizeof etid,
                                       &is_app, msg, sizeof msg);
+        /* which base each side builds on, the console wants them equal */
+        ri = installed_origin(tid, &oi, wi, sizeof wi);
+        rp = package_origin(dest, &op, wp, sizeof wp);
+        snprintf(bi, sizeof bi, "%s/%s", oi.content, oi.master);
+        snprintf(bp, sizeof bp, "%s/%s", op.content, op.master);
         snprintf(resp, sizeof resp,
                  "{\"ok\":%s,\"pkg_content_id\":\"%s\",\"pkg_title_id\":\"%s\","
                  "\"is_app\":%s,\"target_content_id\":\"%s\",\"target_title_id\":\"%s\","
                  "\"storage_title_id\":\"%s\",\"installable\":%s,"
-                 "\"install_plan\":\"installbypackage\",\"msg\":\"%s\"}",
+                 "\"install_plan\":\"installbypackage\",\"msg\":\"%s\","
+                 "\"base_installed\":\"%s\",\"base_package\":\"%s\",\"base_fits\":%s}",
                  rc == 0 ? "true" : "false", ecid, etid, is_app ? "true" : "false",
                  cid, tid, psti,
                  /* Sony's title-id query comes back empty for some
                     pkgs, because why not. the content id has it too */
                  (rc == 0 && (!strncmp(etid, tid, 9) ||
                               (ecid[0] && !strcmp(ecid, cid)))) ? "true" : "false",
-                 msg);
+                 msg, ri ? wi : bi, rp ? wp : bp,
+                 ri || rp ? "null" : !strcmp(bi, bp) ? "true" : "false");
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
     }
 
