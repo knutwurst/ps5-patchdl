@@ -88,6 +88,9 @@ int patchdl_scan_sys_statvfs(const char *path, struct statvfs *out);
 /* the kept system root for openat/fstatat, -1 before the first scan */
 int patchdl_scan_root_fd(void);
 
+/* errno of the last failed read of a title's file, 0 if none failed */
+int patchdl_scan_read_errno(void);
+
 /* <title dir>/<name> via the kept system root, thread-safe, cwd untouched */
 int patchdl_scan_read_app_file(const char *title_id, const char *name,
                                char *buf, size_t sz);

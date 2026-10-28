@@ -13,6 +13,7 @@
 #include <ps5/kernel.h>
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -606,20 +607,57 @@ static const char *PATCH_DIRS[] = {
     NULL,
 };
 
+static _Atomic int g_read_errno;
+
+/* M.2 (#24): reading a game's app.json failed, and the same read a moment
+   later worked. which step failed and why is unknown, so open and read up
+   to three times with a short pause, and touch the buffer first in case
+   the read can't fault in fresh pages. 0 read, -1 can't open (the next
+   base may have it, as before), else the errno of the failed read */
+static int
+open_read_at(const char *path, char *buf, size_t len, off_t offset, ssize_t *got_out) {
+    int err = 0, opened = 0;
+    for (int tries = 0; tries < 3; tries++) {
+        size_t  got = 0;
+        ssize_t n   = 0;
+        int     fd;
+        if (tries) usleep(50 * 1000);
+        if ((fd = openat(g_sysroot_fd, path, O_RDONLY | O_CLOEXEC)) < 0) {
+            if (errno == ENOENT || errno == ENOTDIR) return -1;
+            err = errno;
+            continue;
+        }
+        opened = 1;
+        memset(buf, 0, len);
+        while (got < len && (n = pread(fd, buf + got, len - got, offset + (off_t)got)) > 0)
+            got += (size_t)n;
+        if (n < 0 && !got) err = errno;
+        close(fd);
+        if (n >= 0 || got) {
+            *got_out = (ssize_t)got;
+            return 0;
+        }
+    }
+    g_read_errno = err ? err : EIO;
+    return opened ? g_read_errno : -1;
+}
+
+int
+patchdl_scan_read_errno(void) {
+    return g_read_errno;
+}
+
 static int
 read_title_file(const char *const *bases, const char *title_id, const char *name,
                 char *buf, size_t sz) {
-    char path[PATH_MAX];
+    char    path[PATH_MAX];
+    ssize_t n;
     if (g_sysroot_fd < 0 || !sz) return -1;
     for (int i = 0; bases[i]; i++) {
-        int     fd;
-        ssize_t n;
+        int rc;
         snprintf(path, sizeof(path), "%s/%s/%s", bases[i] + 1, title_id, name);
-        fd = openat(g_sysroot_fd, path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) continue;
-        n = read(fd, buf, sz - 1);
-        close(fd);
-        if (n < 0) return -1;
+        if ((rc = open_read_at(path, buf, sz - 1, 0, &n)) < 0) continue;
+        if (rc) return -1;
         buf[n] = '\0';
         return 0;
     }
@@ -687,14 +725,11 @@ patchdl_scan_read_app_range(const char *title_id, const char *name,
     char path[PATH_MAX];
     if (g_sysroot_fd < 0 || offset < 0 || !len) return -1;
     for (int i = 0; SCAN_DIRS[i]; i++) {
-        int     fd;
         ssize_t n;
+        int     rc;
         snprintf(path, sizeof(path), "%s/%s/%s", SCAN_DIRS[i] + 1, title_id, name);
-        fd = openat(g_sysroot_fd, path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) continue;
-        n = pread(fd, buf, len, (off_t)offset);
-        close(fd);
-        return n;
+        if ((rc = open_read_at(path, buf, len, (off_t)offset, &n)) < 0) continue;
+        return rc ? -1 : n;
     }
     return -1;
 }
