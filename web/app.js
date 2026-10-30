@@ -40,7 +40,7 @@ const fallback = {
   config: {
     default_policy: "deny",
     download_dir: "/data/patchdl (internal)",
-    install_after_download: false,
+    install_after_download: true,
     delete_pkg_after_install: true,
     verify_downloads: false,
     home_shortcut: true,

@@ -215,7 +215,7 @@ static struct {
     int  home_shortcut;            /* home-screen tile */
     int  max_connections;          /* 1..POOL_MAX_CONN */
     char download_drive[32];       /* /data, /mnt/extN or /mnt/usbN */
-} g_cfg = { "deny", 0, 1, 0, 1, 4, "/data" };
+} g_cfg = { "deny", 1, 1, 0, 1, 4, "/data" };
 
 /* workers share one job, extra titles queue. the sidecar bitmap survives
    reboots. lock: g_pool.mtx, not g_mutex */
