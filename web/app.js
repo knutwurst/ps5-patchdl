@@ -798,7 +798,6 @@ function createGameCard(game) {
       ${game.resumable && !game.downloading ? `<span class="pill warn">${t("pill.paused")}</span>` : ""}
       ${statusPill(game)}
       ${sourcePill(game)}
-      ${game.builtin ? `<span class="pill warn" title="${escapeHtml(t("pill.experimentalTitle"))}">${t("pill.experimental")}</span>` : ""}
       ${game.sideloaded ? `<span class="pill warn" title="${escapeHtml(t("pill.sideloadedTitle"))}">${t("pill.sideloaded")}</span>` : ""}
     </div>
     ${versionTrackHtml(game)}
