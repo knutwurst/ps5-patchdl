@@ -24,7 +24,7 @@
 
 <p align="center">
   If you like what I do, you can buy me a coffee*:
-  <a href="https://paypal.me/oliverkoester"><img src="https://img.shields.io/badge/Donate-PayPal-22c55e?style=flat-square&logo=paypal&logoColor=white" alt="Donate via PayPal"></a><br>
+  <a href="https://ko-fi.com/knutwurst"><img src="https://img.shields.io/badge/Donate-Ko--fi-22c55e?style=flat-square&logo=kofi&logoColor=white" alt="Donate via Ko-fi"></a><br>
   <sub>*It doesn't have to be a generous donation. A few cents are enough to show me who is interested in further development. So the motivation stays and I just know that I am not programming for the bin ;)</sub>
 </p>
 
@@ -124,7 +124,7 @@ Built on [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/), [libcurl]
 
 ## Support
 
-If you like what I do, you can buy me a coffee*: [![Donate](https://img.shields.io/badge/Donate-PayPal-22c55e?style=flat-square&logo=paypal&logoColor=white)](https://paypal.me/oliverkoester)
+If you like what I do, you can buy me a coffee*: [![Donate](https://img.shields.io/badge/Donate-Ko--fi-22c55e?style=flat-square&logo=kofi&logoColor=white)](https://ko-fi.com/knutwurst)
 
 <sub>*It doesn't have to be a generous donation. A few cents are enough to show me who is interested in further development. So the motivation stays and I just know that I am not programming for the bin ;)</sub>
 

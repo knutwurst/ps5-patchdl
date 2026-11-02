@@ -375,7 +375,7 @@ async function openDiag(titleId) {
   });
 }
 
-const DONATE_URL = "https://paypal.me/oliverkoester";
+const DONATE_URL = "https://ko-fi.com/knutwurst";
 
 // a link is useless on the TV, hence the QR (hidden on phones)
 function openDonate() {
