@@ -70,6 +70,8 @@ PatchDL only updates games installed from disc or the PlayStation Store. It does
 2. Send it to your PS5 with the ELF loader you already use.
 3. The console shows a notification with the address, e.g. `http://192.168.0.42:12880/`. Open it in a browser on the same network.
 
+Official builds are only published in this repository's [releases](https://github.com/knutwurst/ps5-patchdl/releases). GitHub Actions builds each one from the tagged source, and the release notes list the SHA-256 of the ELF. If you got PatchDL from somewhere else, compare it with `shasum -a 256 patchdl_<version>.elf` (macOS, Linux) or `certutil -hashfile patchdl_<version>.elf SHA256` (Windows).
+
 You need a PS5 that can load ELF payloads. PatchDL should run on firmware 1.00 to 13.60; I've tested it on 11.60 and 13.60.
 
 ## FAQ
