@@ -10,7 +10,7 @@
 
 #pragma once
 
-#define PATCHDL_VERSION "0.3.12"
+#define PATCHDL_VERSION "0.3.13"
 
 /* set by the Makefile from GitHub Actions, empty for a local build */
 #ifndef PATCHDL_BUILD_REPO
