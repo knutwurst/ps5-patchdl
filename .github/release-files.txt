@@ -4,3 +4,4 @@
 patchdl-ps5.elf
 README.md
 LICENSE
+NOTICE

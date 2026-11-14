@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Knutwurst, https://github.com/knutwurst/ps5-patchdl
+// Additional terms under section 7 of the GPL apply, see the NOTICE file.
 const API = {
   status: "/api/status",
   titles: "/api/titles",
@@ -346,7 +349,7 @@ async function openDiag(titleId) {
 
   const report = [
     "PatchDL diagnostic report",
-    `PatchDL ${status ? status.version : "?"} · FW ${status ? status.firmware : "?"}`,
+    `PatchDL ${status ? status.version : "?"} (${status && status.build_repo ? `${status.build_repo}@${status.build_commit}` : "local build"}) · FW ${status ? status.firmware : "?"}`,
     `Game: ${name} (${titleId})${game ? ` · installed ${game.installed_version || "?"} · ${game.source_type}${game.sideloaded ? ", sideloaded" : ""}` : ""}`,
     `Download: ${job ? JSON.stringify(job) : "none"}`,
     `Network check: ${check ? JSON.stringify(check) : "unavailable"}`,
@@ -447,6 +450,8 @@ function bindElements() {
     refreshBtn: document.getElementById("refreshBtn"),
     updateAllBtn: document.getElementById("updateAllBtn"),
     brandVersion: document.getElementById("brandVersion"),
+    aboutVersion: document.getElementById("aboutVersion"),
+    aboutBuild: document.getElementById("aboutBuild"),
     globalDl:         document.getElementById("globalDl"),
     globalDlState:    document.getElementById("globalDlState"),
     globalDlName:     document.getElementById("globalDlName"),
@@ -608,6 +613,14 @@ function renderStatus() {
   if (els.railSpace) els.railSpace.textContent = t("rail.free", { space });
   if (els.brandVersion)
     els.brandVersion.textContent = state.status.version ? `v${state.status.version}` : "v--";
+  if (els.aboutVersion) els.aboutVersion.textContent = state.status.version || "";
+  if (els.aboutBuild) els.aboutBuild.textContent = buildText(state.status);
+}
+
+// where this ELF was built: the CI fills in the repo, local builds don't
+function buildText(status) {
+  if (!status.build_repo) return t("about.localBuild");
+  return t("about.build", { repo: status.build_repo, commit: status.build_commit || "?" });
 }
 
 const CONN_MIN = 1, CONN_MAX = 16;

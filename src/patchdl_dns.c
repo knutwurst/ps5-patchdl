@@ -5,6 +5,7 @@
  * the terms of the GNU General Public License as published by the Free
  * Software Foundation, either version 3 of the License, or (at your option)
  * any later version. See the LICENSE file in the project root for details.
+ * Additional terms under section 7 of the GPL apply, see the NOTICE file.
  */
 
 #include "patchdl_dns.h"

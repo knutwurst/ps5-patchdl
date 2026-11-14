@@ -44,7 +44,13 @@ SQLITE_CFLAGS := -O2 -w \
         -DSQLITE_DEFAULT_MEMSTATUS=0 \
         -DSQLITE_OMIT_DEPRECATED
 
+# shown under About. GitHub Actions sets both, a local build leaves the repo
+# empty. only [A-Za-z0-9._/-] get through, the values land in JSON
+BUILD_REPO   ?= $(shell printf '%s' "$$GITHUB_REPOSITORY" | tr -cd 'A-Za-z0-9._/-')
+BUILD_COMMIT ?= $(shell printf '%s' "$$GITHUB_SHA" | tr -cd '0-9a-f' | cut -c1-7)
+
 CFLAGS := -g -O2 -Wall -Werror -Isrc -I"$(ETAHEN_DEPS_DIR)/include" -I"$(SQLITE_DIR)" -DPATCHDL_HTTP_PORT=$(PATCHDL_HTTP_PORT)
+CFLAGS += -DPATCHDL_BUILD_REPO='"$(BUILD_REPO)"' -DPATCHDL_BUILD_COMMIT='"$(BUILD_COMMIT)"'
 LDADD := -L"$(ETAHEN_DEPS_DIR)/lib" -lmicrohttpd -lkernel_sys -lpthread
 
 ifdef CURL_DIR

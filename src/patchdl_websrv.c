@@ -5,6 +5,7 @@
  * the terms of the GNU General Public License as published by the Free
  * Software Foundation, either version 3 of the License, or (at your option)
  * any later version. See the LICENSE file in the project root for details.
+ * Additional terms under section 7 of the GPL apply, see the NOTICE file.
  */
 
 #include "patchdl_websrv.h"
@@ -1147,11 +1148,11 @@ titles_gen(void) {
 static char *
 build_status_json(void) {
     char  ip[INET_ADDRSTRLEN], root[64];
-    char *out = malloc(896);
+    char *out = malloc(1280);
     if (!out) return NULL;
     lan_ipv4(ip, sizeof ip);
     current_root(root, sizeof root);
-    snprintf(out, 896,
+    snprintf(out, 1280,
              "{\"firmware\":\"%s\","
              "\"firmware_build\":\"0x%08x\","
              "\"dns_guard\":\"Active\","
@@ -1161,13 +1162,15 @@ build_status_json(void) {
              "\"lan_ip\":\"%s\","
              "\"http_port\":%d,"
              "\"version\":\"%s\","
+             "\"build_repo\":\"%s\",\"build_commit\":\"%s\","
              "\"titles_gen\":%lu,"
              "\"downloads_bytes\":%lld,"
              "\"rescan_ms\":[%ld,%ld,%ld],"
              "\"rescan_step\":\"%s / %s\",\"rescan_running_ms\":%ld,"
              "\"web_restarts\":%u}",
              g_fw.str, g_fw.bin, data_free_mb(), root, ip, PATCHDL_HTTP_PORT,
-             PATCHDL_VERSION, titles_gen(), downloads_bytes(),
+             PATCHDL_VERSION, PATCHDL_BUILD_REPO, PATCHDL_BUILD_COMMIT,
+             titles_gen(), downloads_bytes(),
              g_rescan_ms[0], g_rescan_ms[1], g_rescan_ms[2],
              g_rescan_step, patchdl_scan_step(),
              strcmp(g_rescan_step, "idle") ? mono_ms() - g_rescan_since : 0L,

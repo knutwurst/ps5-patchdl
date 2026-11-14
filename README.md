@@ -134,4 +134,6 @@ If you like what I do, you can buy me a coffee*: [![Donate](https://img.shields.
 
 GNU General Public License v3.0 or later, see [LICENSE](LICENSE).
 
+Additional terms under section 7 of the GPL apply, see [NOTICE](NOTICE). Forks are welcome, but they have to keep my copyright notices and the attribution in the About box, and say that they are a modified version of PatchDL.
+
 Copyright © 2026 Knutwurst.

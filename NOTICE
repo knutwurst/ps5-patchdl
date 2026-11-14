@@ -1,0 +1,34 @@
+PatchDL
+Copyright (C) 2026 Knutwurst
+https://github.com/knutwurst/ps5-patchdl
+
+PatchDL is free software under the GNU General Public License version 3
+or, at your option, any later version. See LICENSE.
+
+
+Additional terms under section 7 of the GNU GPL
+
+These terms apply to all material in PatchDL written by Knutwurst, as
+permitted by sections 7(b) and 7(c) of the GPL.
+
+1. Author attribution (section 7(b)). Every copy and every modified
+   version of PatchDL, in source or object form, must:
+
+   a) keep the notice "Copyright (C) 2026 Knutwurst" in each source file
+      that contains material from PatchDL, and
+
+   b) show the attribution
+
+          PatchDL · Copyright © 2026 Knutwurst
+          https://github.com/knutwurst/ps5-patchdl
+
+      in its Appropriate Legal Notices. In PatchDL these are the About
+      box at the end of the settings page of the web interface.
+
+   A modified version may add its own name, authors and copyright lines
+   next to this attribution.
+
+2. Marking of modified versions (section 7(c)). A modified version must
+   not present itself as the original PatchDL or present its changes as
+   the work of Knutwurst. Its README and its Appropriate Legal Notices
+   must say that it is a modified version of PatchDL and since when.

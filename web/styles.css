@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Knutwurst, https://github.com/knutwurst/ps5-patchdl
+ * Additional terms under section 7 of the GPL apply, see the NOTICE file.
+ */
 :root {
   color-scheme: dark;
   --bg: #0a0c0f;
@@ -153,6 +157,19 @@ svg {
   color: var(--muted);
 }
 .donate-row .row-button { width: auto; padding: 0 16px; }
+.about-row {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+.about-row strong { color: var(--ink); font-size: var(--fs-md); }
+.about-row p { margin: 0; overflow-wrap: anywhere; }
+.about-row a { color: inherit; }
 .diag-body { display: grid; gap: 14px; }
 .diag-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .diag-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; }
